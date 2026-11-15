@@ -1,0 +1,31 @@
+{
+  "dataset": "demo-replay-v1",
+  "label": "Demo fixture. These bars are not a recording of a real market.",
+  "tokens": [
+    {
+      "mint": "demo:replay",
+      "symbol": "DEMO-REPLAY",
+      "decimals": 6,
+      "security": [
+        {"ts": "2026-01-01T00:10:00+00:00", "classification": "pass", "source": "demo_fixture"}
+      ],
+      "bars": [
+        {"ts": "2026-01-01T00:15:00+00:00", "close": "1.00", "volume": "1000", "liquidity": "80000"},
+        {"ts": "2026-01-01T00:20:00+00:00", "close": "1.05", "volume": "1800", "liquidity": "82000"},
+        {"ts": "2026-01-01T00:25:00+00:00", "close": "1.30", "volume": "4000", "liquidity": "83000"}
+      ]
+    },
+    {
+      "mint": "demo:replay-gap",
+      "symbol": "DEMO-GAP",
+      "decimals": 6,
+      "security": [
+        {"ts": "2026-01-01T00:25:00+00:00", "classification": "pass", "source": "demo_fixture"}
+      ],
+      "bars": [
+        {"ts": "2026-01-01T00:15:00+00:00", "close": "2.00", "volume": "500", "liquidity": "90000"},
+        {"ts": "2026-01-01T00:20:00+00:00", "close": "2.10", "volume": "700", "liquidity": "90000"}
+      ]
+    }
+  ]
+}

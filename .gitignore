@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 .mypy_cache/
 .env
-data/
+/data/
 *.db
 frontend/node_modules/
 frontend/dist/
