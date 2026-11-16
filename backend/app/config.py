@@ -39,9 +39,28 @@ class Settings(BaseSettings):
     )
     gmgn_api_key: str = Field(default="", alias="GMGN_API_KEY")
     gmgn_base_url: str = Field(default="https://openapi.gmgn.ai", alias="GMGN_BASE_URL")
+
+    # Optional paid JEV (TypeSafe System One) — disabled by default for zero-additional-cost operation.
+    enable_optional_jev: bool = Field(default=False, alias="SOLSWARM_ENABLE_OPTIONAL_JEV")
     typesafe_api_key: str = Field(default="", alias="TYPESAFE_API_KEY")
     typesafe_model: str = Field(default="jev-latest", alias="TYPESAFE_DEFAULT_MODEL")
     typesafe_base_url: str = Field(default="https://api.typesafe.ai", alias="TYPESAFE_BASE_URL")
+
+    # Supabase Free shared coordination (optional; falls back seamlessly to local SQLite when unset).
+    supabase_url: str = Field(default="", alias="SUPABASE_URL")
+    supabase_anon_key: str = Field(default="", alias="SUPABASE_ANON_KEY")
+    supabase_service_role_key: str = Field(default="", alias="SUPABASE_SERVICE_ROLE_KEY")
+    supabase_db_limit_bytes: int = Field(default=500 * 1024 * 1024, alias="SOLSWARM_SUPABASE_LIMIT_BYTES")
+    supabase_task_ttl_hours: int = Field(default=24, alias="SOLSWARM_SUPABASE_TASK_TTL_HOURS")
+    supabase_finding_ttl_hours: int = Field(default=72, alias="SOLSWARM_SUPABASE_FINDING_TTL_HOURS")
+    supabase_decision_ttl_days: int = Field(default=14, alias="SOLSWARM_SUPABASE_DECISION_TTL_DAYS")
+    supabase_heartbeat_ttl_hours: int = Field(default=24, alias="SOLSWARM_SUPABASE_HEARTBEAT_TTL_HOURS")
+    supabase_max_payload_bytes: int = Field(default=4096, alias="SOLSWARM_SUPABASE_MAX_PAYLOAD_BYTES")
+
+    # Grok Bot MCP bridge (over Tailscale Serve only; never exposed via Funnel).
+    mcp_enabled: bool = Field(default=True, alias="SOLSWARM_MCP_ENABLED")
+    mcp_token: str = Field(default="", alias="SOLSWARM_MCP_TOKEN")
+    grok_bot_freshness_seconds: int = Field(default=180, alias="SOLSWARM_GROK_BOT_FRESHNESS_SECONDS")
 
     jupiter_api_key: str = Field(default="", alias="JUPITER_API_KEY")
     birdeye_api_key: str = Field(default="", alias="BIRDEYE_API_KEY")
@@ -57,11 +76,18 @@ class Settings(BaseSettings):
 
     initial_equity: Decimal = Field(default=Decimal("1000"))
 
+    @property
+    def supabase_configured(self) -> bool:
+        return bool(self.supabase_url.strip() and self.supabase_service_role_key.strip())
+
     def secret_values(self) -> list[str]:
         values = [
             self.admin_token,
             self.monitor_token,
+            self.mcp_token,
             self.gmgn_api_key,
+            self.supabase_anon_key,
+            self.supabase_service_role_key,
             self.typesafe_api_key,
             self.jupiter_api_key,
             self.birdeye_api_key,

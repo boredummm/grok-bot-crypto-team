@@ -281,3 +281,88 @@ it("renders the SOL SWARM + JEV 8-seat GMGN control room, real paper balance, an
   fireEvent.click(screen.getByTestId("demo-playback-toggle"));
   await waitFor(() => expect(screen.getByTestId("demo-playback-banner")).toBeTruthy());
 });
+
+it("renders the Cost Monitor view with verified $0.00/mo spend, Supabase Free headroom, and honest integration matrix", async () => {
+  sessionStorage.setItem("solswarm.token", "monitor-token-test");
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.includes("/api/summary")) return new Response(JSON.stringify(MOCK_SUMMARY), { status: 200 });
+    if (url.includes("/api/cost-monitor")) {
+      return new Response(
+        JSON.stringify({
+          checked_at: "2026-11-16T05:00:00Z",
+          required_monthly_cost_usd: "0.00",
+          optional_paid_spend_usd: "0.00",
+          zero_additional_cost_verified: true,
+          paper_trading_only: true,
+          live_execution_enabled: false,
+          supabase: {
+            configured: false,
+            mode: "local_sqlite_fallback",
+            organization_audit: { org_slug: "jxyerpsdnnregvudaqda", plan: "free", inactivity_pause_days: 7, pause_mitigation: "Task Scheduler" },
+            free_tier_limit_bytes: 524288000,
+            free_tier_limit_mb: 500.0,
+            free_tier_egress_limit_bytes: 5368709120,
+            database_bytes: null,
+            swarm_tables_bytes: 14200,
+            usage_pct: 0.003,
+            headroom_bytes: 524273800,
+            headroom_mb: 499.99,
+            row_counts: { swarm_agent_tasks: 4, swarm_agent_findings: 3, swarm_agent_heartbeats: 8, swarm_decisions: 1, swarm_dashboard_state: 1 },
+            retention_policy: { task_ttl_hours: 24, finding_ttl_hours: 72, heartbeat_ttl_hours: 24, decision_ttl_days: 14, max_payload_bytes: 4096, max_tasks_rows: 500, max_findings_rows: 1000, max_decisions_rows: 1000 },
+            last_sync_at: null,
+            last_prune_at: "2026-11-16T05:00:00Z",
+            last_error: null,
+          },
+          local_storage: {
+            sqlite_path: "/workspace/data/solswarm.db",
+            sqlite_bytes: 131072,
+            wal_bytes: 4096,
+            shm_bytes: 32768,
+            total_local_bytes: 167936,
+            historical_data_isolated_locally: true,
+            historical_row_counts: { market_observations: 18, kline_bars: 12, agent_events: 24, paper_orders: 1, backtest_runs: 0 },
+          },
+          gmgn_rate_limits: {
+            configured: true,
+            is_public_test_key: false,
+            limit: 5,
+            remaining: 3,
+            reset_unix: null,
+            banned_until_unix: null,
+            quote_endpoint_plan_limited: true,
+            quote_fallback: "gmgn_amm_reserve_quote",
+          },
+          grok_bot: {
+            mcp_enabled: true,
+            mcp_endpoint: "/api/mcp",
+            freshness_window_seconds: 180,
+            fresh_seats: ["CHIEF", "SCAN", "VET", "SOCIAL"],
+            fallback_mode: "deterministic_fallback",
+          },
+          decision_sources: { grok_bot: 1, deterministic_fallback: 2, optional_jev: 0 },
+          integrations: [
+            { id: "gmgn_readonly_api", name: "GMGN Official Read-Only OpenAPI", classification: "free_active", monthly_cost_usd: "0.00", required: false, missing_env: [], detail: "Read-only Exist Auth active ($0 Free key)." },
+            { id: "optional_jev_typesafe", name: "Optional TypeSafe System One (JEV)", classification: "optional_paid_disabled", monthly_cost_usd: "0.00", required: false, missing_env: [], detail: "Disabled by default." },
+            { id: "live_swaps_wallet_signing", name: "Live Swap Execution & Wallet Signing", classification: "permanently_disabled", monthly_cost_usd: "0.00", required: false, missing_env: [], detail: "Structurally blocked." },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  });
+
+  render(
+    <MemoryRouter initialEntries={["/cost"]}>
+      <App />
+    </MemoryRouter>,
+  );
+
+  await waitFor(() => expect(screen.getByTestId("cost-monitor-view")).toBeTruthy());
+  expect(screen.getByTestId("zero-cost-verified-pill").textContent).toContain("$0.00/MO VERIFIED");
+  expect(screen.getByTestId("required-monthly-cost").textContent).toBe("$0.00");
+  expect(screen.getByTestId("integration-row-gmgn_readonly_api")).toBeTruthy();
+  expect(screen.getByTestId("integration-row-optional_jev_typesafe").textContent).toContain("optional_paid_disabled");
+  expect(screen.getByTestId("integration-row-live_swaps_wallet_signing").textContent).toContain("permanently_disabled");
+});

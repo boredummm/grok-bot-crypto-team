@@ -201,6 +201,7 @@ export type SeatCard = {
   subtitle: string;
   badge: string;
   jev_connected: boolean;
+  decision_source?: string;
   status: string;
   metric_label: string;
   metric_value: string;
@@ -268,7 +269,9 @@ export type FeaturedToken = CandidateToken & {
 
 export type DeskState = {
   mode: "demo" | "live";
+  mode_badge?: string;
   data_label: string;
+  decision_source?: string;
   paper_trading: boolean;
   live_execution_enabled: boolean;
   emergency_stop: boolean;
@@ -400,4 +403,92 @@ export type DemoPlaybackData = {
   is_demo_playback: boolean;
   label: string;
   steps: DemoPlaybackStep[];
+};
+
+export type IntegrationClassification =
+  | "free_active"
+  | "free_unconfigured"
+  | "unavailable_limitation"
+  | "optional_paid_disabled"
+  | "optional_paid_active"
+  | "permanently_disabled";
+
+export type IntegrationItem = {
+  id: string;
+  name: string;
+  classification: IntegrationClassification;
+  monthly_cost_usd: string;
+  required: boolean;
+  missing_env: string[];
+  detail: string;
+  meta?: Record<string, unknown>;
+};
+
+export type CostMonitorData = {
+  checked_at: string;
+  required_monthly_cost_usd: string;
+  optional_paid_spend_usd: string;
+  zero_additional_cost_verified: boolean;
+  paper_trading_only: boolean;
+  live_execution_enabled: boolean;
+  supabase: {
+    configured: boolean;
+    mode: "supabase_postgrest" | "local_sqlite_fallback";
+    organization_audit: {
+      org_slug: string;
+      plan: string;
+      inactivity_pause_days: number;
+      pause_mitigation: string;
+    };
+    free_tier_limit_bytes: number;
+    free_tier_limit_mb: number;
+    free_tier_egress_limit_bytes: number;
+    database_bytes: number | null;
+    swarm_tables_bytes: number;
+    usage_pct: number;
+    headroom_bytes: number;
+    headroom_mb: number;
+    row_counts: Record<string, number>;
+    retention_policy: {
+      task_ttl_hours: number;
+      finding_ttl_hours: number;
+      heartbeat_ttl_hours: number;
+      decision_ttl_days: number;
+      max_payload_bytes: number;
+      max_tasks_rows: number;
+      max_findings_rows: number;
+      max_decisions_rows: number;
+    };
+    last_sync_at: string | null;
+    last_prune_at: string | null;
+    last_error: string | null;
+  };
+  local_storage: {
+    sqlite_path: string;
+    sqlite_bytes: number;
+    wal_bytes: number;
+    shm_bytes: number;
+    total_local_bytes: number;
+    historical_data_isolated_locally: boolean;
+    historical_row_counts: Record<string, number>;
+  };
+  gmgn_rate_limits: {
+    configured: boolean;
+    is_public_test_key: boolean;
+    limit: number | null;
+    remaining: number | null;
+    reset_unix: number | null;
+    banned_until_unix: number | null;
+    quote_endpoint_plan_limited: boolean;
+    quote_fallback: string;
+  };
+  grok_bot: {
+    mcp_enabled: boolean;
+    mcp_endpoint: string;
+    freshness_window_seconds: number;
+    fresh_seats: string[];
+    fallback_mode: string;
+  };
+  decision_sources: Record<string, number>;
+  integrations: IntegrationItem[];
 };

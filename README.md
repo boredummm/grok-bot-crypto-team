@@ -1,8 +1,12 @@
-# SOL SWARM + JEV (GMGN Paper Control Room)
+# SOL SWARM (Zero-Cost GMGN + Grok Bot + Supabase Free Paper Control Room)
 
-Local Solana memecoin research and paper-trading desk with a top-down 2D pixel-art control room (`SOL SWARM + JEV`). The system discovers Solana tokens, runs deterministic stage gates (`free_kill -> trade_kill -> chain_kill -> soft_kill -> pick`), optionally calls TypeSafe System One (`JEV`) for typed `noul` / `choice` / `score` judgements when `TYPESAFE_API_KEY` is provided, and simulates paper entries only after the independent deterministic `RiskEngine` approves them.
+Local Solana memecoin research and paper-trading desk with a top-down 2D pixel-art control room (`SOL SWARM + JEV`). Operates with **$0.00/mo additional required monthly spend** using:
 
-It does not create wallets, accept trading private keys, sign transactions, or execute live swaps. GMGN is integrated strictly via its official read-only OpenAPI (`Exist Auth`) for market, security, kline, and paper quote simulation.
+- **GMGN Official Read-Only OpenAPI (`Exist Auth`)** for Solana trending (`/v1/market/rank`), token info/security (`/v1/token/info`, `/v1/token/security`), 5m candlesticks (`/v1/market/token_kline`), and paper quote simulation (with automatic AMM pool-reserve paper quote fallback when `/v1/trade/quote` weight 11 exceeds the Free-tier limit of 5).
+- **Grok Bot Teammates (`SCAN`, `VET`, `SOCIAL`, `CHIEF`)** via existing Cursor subscription connected over **Tailscale Personal + Tailscale Serve** (`POST /api/mcp` authenticated Streamable HTTP MCP bridge) + **Free Local Deterministic Fallback** (`decision_source="deterministic_fallback"`) whenever Grok Bot teammates are offline.
+- **Storage Split**: Historical market observations, candlesticks (`kline_bars`), and replay runs stay **100% local** in Windows SQLite (`data/solswarm.db`), while **Supabase Free** (`< 500 MB`) stores only compact coordination rows (`<= 4 KB` payload cap + automatic TTL/row-cap retention pruning).
+- **Windows Task Scheduler** (`scripts/windows/*.ps1`) for zero-cost local recurring discovery cycles and Supabase Free retention/keepalive pruning.
+- **Paper-Only Safety**: No wallets, no private keys, no signing, and no live swaps. Independent deterministic `SIZE`, `FILLS`, `RiskEngine` final veto, and Emergency Stop remain active at all times.
 
 ## Start
 
@@ -12,25 +16,29 @@ Windows PowerShell:
 .\scripts\start.ps1
 ```
 
+Register recurring local cycles & retention pruning on Windows Task Scheduler ($0/mo):
+
+```powershell
+.\scripts\windows\register-task-scheduler.ps1 -CycleMinutes 5 -PruneHours 6
+```
+
 Linux or macOS:
 
 ```bash
 bash scripts/start.sh
 ```
 
-Dashboard: http://127.0.0.1:5173  
-API: http://127.0.0.1:8000
+Dashboard: http://127.0.0.1:5173 (includes `/cost` **Cost Monitor**)  
+API: http://127.0.0.1:8000  
+MCP Bridge (Tailscale Serve only): `POST /api/mcp`
 
-`start.ps1` and `start.sh` generate distinct `SOLSWARM_ADMIN_TOKEN` and `SOLSWARM_MONITOR_TOKEN` secrets into `.env` without printing them. Paste either token into the dashboard login gate. Monitor tokens are read-only; admin tokens are required to pause/resume entries, edit `thresholds.py` / settings, or trigger scans.
+`start.ps1` generates distinct `SOLSWARM_ADMIN_TOKEN`, `SOLSWARM_MONITOR_TOKEN`, and `SOLSWARM_MCP_TOKEN` secrets into `.env` without printing them. Tailnet access: see [docs/TAILSCALE.md](docs/TAILSCALE.md). Private Tailscale Serve only; Funnel is never enabled and `/api/mcp` refuses requests if Funnel is detected.
 
-Tailnet access: see [docs/TAILSCALE.md](docs/TAILSCALE.md). Private Tailscale Serve only. Funnel is never enabled.
+## Environment Variables (`.env`)
 
-## Optional Credentials (`.env`)
-
-- `GMGN_API_KEY`: Read-only GMGN OpenAPI key from `https://gmgn.ai/ai` (`X-APIKEY` + `timestamp` + `client_id` UUID). Unlocks GMGN Solana trending (`GET /v1/market/rank`), token info/security (`GET /v1/token/info`, `GET /v1/token/security`), candlesticks (`GET /v1/market/token_kline`), and read-only paper swap quotes (`GET /v1/trade/quote`). Swap/write endpoints are blocked at the backend service boundary.
-- `TYPESAFE_API_KEY`: TypeSafe System One key (`POST https://api.typesafe.ai/v1/systemone`, default `jev-latest`). Unlocks live `market`, `solana`, and `pick` typed judgements. Without it, the desk displays `JEV NOT CONNECTED` and runs deterministic gates without faking model outputs.
-- `JUPITER_API_KEY`: Secondary quote fallback (`GET /swap/v2/order` with transaction blob stripped).
-- `XAI_API_KEY`: Optional Grok commentary seat (`grok-4-fast`). Never overrides risk limits or authorizes trades.
+- `GMGN_API_KEY`: Free read-only GMGN OpenAPI key from `https://gmgn.ai/ai`. Swap/write endpoints are blocked at the backend service boundary.
+- `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`: Optional Supabase Free project (`supabase/migrations/20261116000000_sol_swarm_zero_cost.sql`) for shared coordination. Falls back seamlessly to local SQLite when unset.
+- `SOLSWARM_ENABLE_OPTIONAL_JEV`: `false` by default ($0.00/mo). Optional paid TypeSafe System One (`TYPESAFE_API_KEY`) and direct xAI API (`XAI_API_KEY`) are not required.
 
 ## Tests
 
@@ -43,5 +51,5 @@ cd frontend && npm test && npm run build
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Risk model](docs/RISK_MODEL.md)
-- [API](docs/API.md)
+- [API & MCP Bridge](docs/API.md)
 - [Tailscale](docs/TAILSCALE.md)

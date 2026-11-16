@@ -290,6 +290,14 @@ export function RetroControlRoom({
           <button
             type="button"
             className="retro-btn"
+            onClick={() => navigate("/cost")}
+            title="Open $0 Cost & Supabase Free Monitor"
+          >
+            $0 COST
+          </button>
+          <button
+            type="button"
+            className="retro-btn"
             onClick={() => setViewMode("classic")}
           >
             CLASSIC
@@ -663,9 +671,9 @@ export function RetroControlRoom({
                     </div>
                   </div>
                   <div>
-                    <span className="muted">JEV / GMGN Provenance</span>
+                    <span className="muted">Decision Provenance</span>
                     <div>
-                      {inspection.data_sources.jev.status_label} · {inspection.data_sources.gmgn.venue_label}
+                      <strong>{inspection.card.decision_source || "deterministic_fallback"}</strong> · {inspection.data_sources.jev.status_label} · {inspection.data_sources.gmgn.venue_label}
                     </div>
                   </div>
                   <div>

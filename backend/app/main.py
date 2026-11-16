@@ -10,14 +10,16 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.auth import Role, require_admin, resolve_role
 from app.config import ROOT, Settings
+from app.cost_monitor import cost_monitor_report, integrations_status_report
 from app.db import init_engine, session_scope
 from app.logging_config import configure_logging
+from app.mcp_bridge import MCP_PROTOCOL_VERSION, MCP_TOOLS, handle_mcp_jsonrpc
 from app.models import BacktestRun
 from app.queries import (
     agents,
@@ -26,6 +28,7 @@ from app.queries import (
     backtest_detail,
     backtests,
     bench_list,
+    coordination_state,
     decisions,
     demo_playback,
     desk_state,
@@ -372,6 +375,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def get_tailscale(_role: Role = Depends(reader_header)):
         return tailscale_health()
 
+    @app.get("/api/cost-monitor")
+    async def get_cost_monitor(_role: Role = Depends(reader_header)):
+        if settings.supabase_configured and swarm.coord.remote_telemetry is None:
+            await swarm.coord.refresh_remote_telemetry()
+        return cost_monitor_report(settings, swarm)
+
+    @app.get("/api/integrations/status")
+    async def get_integrations_status(_role: Role = Depends(reader_header)):
+        if settings.supabase_configured and swarm.coord.remote_telemetry is None:
+            await swarm.coord.refresh_remote_telemetry()
+        return integrations_status_report(settings, swarm)
+
+    @app.get("/api/coordination")
+    def get_coordination(_role: Role = Depends(reader_header)):
+        return coordination_state(swarm)
+
+    @app.get("/api/mcp")
+    def get_mcp_info(role: Role = Depends(reader_header)):
+        ts = tailscale_health()
+        if ts.get("funnel_enabled"):
+            raise HTTPException(status_code=403, detail="Tailscale Funnel detected; MCP public exposure is forbidden")
+        return {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "transport": "streamable-http",
+            "endpoint": "/api/mcp",
+            "role": role.value,
+            "tools": [t["name"] for t in MCP_TOOLS if role in {Role.ADMIN, Role.AGENT} or t["annotations"]["readOnlyHint"]],
+            "tailscale_serve_only": True,
+        }
+
+    @app.post("/api/mcp")
+    async def post_mcp(request: Request, role: Role = Depends(reader_header)):
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+        status_code, payload = await handle_mcp_jsonrpc(body, role=role, settings=settings, swarm=swarm)
+        if payload is None:
+            return Response(status_code=status_code)
+        if status_code == 200 and isinstance(payload, dict) and isinstance(payload.get("result"), dict):
+            sc = payload["result"].get("structuredContent")
+            if isinstance(sc, dict) and sc.get("accepted") is True:
+                await hub.publish({"type": "grok_bot_mcp", "summary": summary(settings, swarm)})
+        return JSONResponse(status_code=status_code, content=payload)
+
+    @app.post("/api/control/prune-retention")
+    async def post_prune(_role: Role = Depends(admin_header)):
+        result = await swarm.coord.prune_expired()
+        return result
+
     @app.post("/api/control/emergency-stop")
     async def post_stop(body: StopBody, _role: Role = Depends(admin_header)):
         result = swarm.emergency_stop(body.reason, actor="admin")
@@ -499,6 +552,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/monitor/decisions")
     def monitor_decisions(_role: Role = Depends(reader_header)):
         return decisions()
+
+    @app.get("/api/monitor/cost-monitor")
+    async def monitor_cost_monitor(_role: Role = Depends(reader_header)):
+        if settings.supabase_configured and swarm.coord.remote_telemetry is None:
+            await swarm.coord.refresh_remote_telemetry()
+        return cost_monitor_report(settings, swarm)
+
+    @app.get("/api/monitor/integrations/status")
+    async def monitor_integrations_status(_role: Role = Depends(reader_header)):
+        if settings.supabase_configured and swarm.coord.remote_telemetry is None:
+            await swarm.coord.refresh_remote_telemetry()
+        return integrations_status_report(settings, swarm)
 
     @app.websocket("/ws")
     async def ws(socket: WebSocket, token: str = ""):

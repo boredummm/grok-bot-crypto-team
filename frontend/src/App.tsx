@@ -2,6 +2,7 @@ import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
 import { NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import {
   Activity,
+  DollarSign,
   Gauge,
   LineChart,
   Radar as RadarIcon,
@@ -35,6 +36,7 @@ import {
   openEventStream,
   setToken,
 } from "./api";
+import { CostMonitor } from "./components/CostMonitor";
 import { RetroControlRoom } from "./components/RetroControlRoom";
 import { compact, money, pct, shortMint, signed, tone } from "./lib/format";
 
@@ -117,14 +119,16 @@ function Shell({ children }: { children: ReactNode }) {
         <NavLink to="/terminal"><Wallet size={15} /> Terminal</NavLink>
         <NavLink to="/analytics"><LineChart size={15} /> Analytics</NavLink>
         <NavLink to="/replay"><Shield size={15} /> Replay</NavLink>
+        <NavLink to="/cost"><DollarSign size={15} /> Cost Monitor</NavLink>
         <NavLink to="/settings"><SettingsIcon size={15} /> Settings</NavLink>
       </aside>
       <div className="main">
         <header className="topbar">
           <div className="pills">
             <span className="pill bad">PAPER ONLY</span>
+            <span className="pill good">$0.00/MO ZERO-COST</span>
             <span className={summary?.mode === "live" ? "pill info" : "pill warn"}>
-              {summary?.mode === "live" ? "LIVE DATA" : "DEMO FIXTURES"}
+              {summary?.mode === "live" ? "LIVE PAPER" : "DEMO"}
             </span>
             <span className={summary?.emergency_stop ? "pill bad" : "pill good"}>
               {summary?.emergency_stop ? "ENTRIES PAUSED" : "ENTRIES OPEN"}
@@ -581,6 +585,7 @@ export default function App() {
         <Route path="/terminal" element={<Terminal />} />
         <Route path="/analytics" element={<Analytics />} />
         <Route path="/replay" element={<Replay />} />
+        <Route path="/cost" element={<CostMonitor />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="/token/*" element={<TokenPage />} />
       </Routes>

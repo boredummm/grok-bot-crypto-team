@@ -356,3 +356,128 @@ class ShadowDecision(Base):
     jev_answers: Mapped[dict | None] = mapped_column(JSONText, nullable=True)
     reasons: Mapped[list] = mapped_column(JSONText)
     paper_notional: Mapped[object | None] = mapped_column(DecimalString, nullable=True)
+
+
+class KlineBar(Base):
+    """Strictly local candlestick cache (never synced to Supabase Free)."""
+
+    __tablename__ = "kline_bars"
+    __table_args__ = (
+        UniqueConstraint("mode", "mint", "resolution", "bar_ts", name="uq_kline_mode_mint_res_ts"),
+        Index("ix_kline_lookup", "mode", "mint", "resolution", "bar_ts"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), index=True)
+    mint: Mapped[str] = mapped_column(String(64), index=True)
+    resolution: Mapped[str] = mapped_column(String(8), default="5m")
+    bar_ts: Mapped[int] = mapped_column(Integer)
+    open_price: Mapped[object] = mapped_column(DecimalString)
+    high_price: Mapped[object] = mapped_column(DecimalString)
+    low_price: Mapped[object] = mapped_column(DecimalString)
+    close_price: Mapped[object] = mapped_column(DecimalString)
+    volume_usd: Mapped[object] = mapped_column(DecimalString, default="0")
+    token_volume: Mapped[object] = mapped_column(DecimalString, default="0")
+    provider: Mapped[str] = mapped_column(String(32), default="gmgn")
+    observed_at: Mapped[object] = mapped_column(UTCDateTime)
+
+
+class SwarmAgentTask(Base):
+    """Compact coordination work item for Grok Bot teammates (SCAN, VET, SOCIAL, CHIEF)."""
+
+    __tablename__ = "swarm_agent_tasks"
+    __table_args__ = (Index("ix_swarm_task_seat_status", "mode", "seat", "status", "created_at"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cycle_id: Mapped[str] = mapped_column(String(64), index=True)
+    mode: Mapped[str] = mapped_column(String(8), index=True)
+    seat: Mapped[str] = mapped_column(String(16), index=True)
+    mint: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=50)
+    evidence_summary: Mapped[dict] = mapped_column(JSONText)
+    created_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+    expires_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+    completed_at: Mapped[object | None] = mapped_column(UTCDateTime, nullable=True)
+
+
+class SwarmAgentFinding(Base):
+    """Compact structured teammate finding per seat/token."""
+
+    __tablename__ = "swarm_agent_findings"
+    __table_args__ = (Index("ix_swarm_finding_mint_seat", "mode", "mint", "seat", "created_at"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cycle_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    mode: Mapped[str] = mapped_column(String(8), index=True)
+    seat: Mapped[str] = mapped_column(String(16), index=True)
+    mint: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    decision_source: Mapped[str] = mapped_column(String(32), index=True)
+    verdict: Mapped[str] = mapped_column(String(16))
+    confidence: Mapped[object | None] = mapped_column(DecimalString, nullable=True)
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    summary: Mapped[str] = mapped_column(Text)
+    finding_payload: Mapped[dict] = mapped_column(JSONText)
+    agent_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+    expires_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+
+
+class SwarmAgentHeartbeat(Base):
+    """Real seat status, last seen, active token, and decision source."""
+
+    __tablename__ = "swarm_agent_heartbeats"
+    seat: Mapped[str] = mapped_column(String(16), primary_key=True)
+    status: Mapped[str] = mapped_column(String(24))
+    decision_source: Mapped[str] = mapped_column(String(32))
+    active_mint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    active_symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    mode: Mapped[str] = mapped_column(String(8), default="demo")
+    agent_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    note: Mapped[str | None] = mapped_column(String(280), nullable=True)
+    meta: Mapped[dict] = mapped_column(JSONText)
+    last_seen_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+    expires_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+
+
+class SwarmStructuredDecision(Base):
+    """Schema-validated structured decision with explicit decision_source."""
+
+    __tablename__ = "swarm_decisions"
+    __table_args__ = (Index("ix_swarm_dec_mode_mint", "mode", "mint", "created_at"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cycle_id: Mapped[str] = mapped_column(String(64), index=True)
+    mode: Mapped[str] = mapped_column(String(8), index=True)
+    mint: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    action: Mapped[str] = mapped_column(String(16))
+    decision_source: Mapped[str] = mapped_column(String(32), index=True)
+    confidence: Mapped[object | None] = mapped_column(DecimalString, nullable=True)
+    size_factor: Mapped[object] = mapped_column(DecimalString, default="1.0")
+    thesis: Mapped[str] = mapped_column(Text)
+    reasons: Mapped[list] = mapped_column(JSONText)
+    risk_approved: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    risk_reason_codes: Mapped[list] = mapped_column(JSONText)
+    paper_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    decision_payload: Mapped[dict] = mapped_column(JSONText)
+    created_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+    expires_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+
+
+class SwarmDashboardState(Base):
+    """Compact office summary snapshot for shared dashboard coordination."""
+
+    __tablename__ = "swarm_dashboard_state"
+    slot: Mapped[str] = mapped_column(String(32), primary_key=True, default="singleton")
+    mode: Mapped[str] = mapped_column(String(8))
+    paper_trading: Mapped[bool] = mapped_column(Boolean, default=True)
+    live_execution_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    emergency_stop: Mapped[bool] = mapped_column(Boolean, default=False)
+    equity_usdc: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    cash_usdc: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    open_positions: Mapped[int] = mapped_column(Integer, default=0)
+    held_symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_source: Mapped[str] = mapped_column(String(32), default="deterministic_fallback")
+    snapshot: Mapped[dict] = mapped_column(JSONText)
+    updated_at: Mapped[object] = mapped_column(UTCDateTime)
+

@@ -123,6 +123,9 @@ class GmgnSecurityPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
     renounced_mint: int | bool | None = None
     renounced_freeze_account: int | bool | None = None
+    is_honeypot: int | bool | None = None
+    honeypot: int | bool | None = None
+    can_not_sell: int | bool | None = None
     buy_tax: str | float | int | None = None
     sell_tax: str | float | int | None = None
     top_10_holder_rate: str | float | int | None = None
@@ -155,6 +158,7 @@ class GmgnDossier:
     smart_degen_count: int | None
     sniper_count: int | None
     creator_status: str | None
+    can_sell_ok: bool = True
 
 
 @dataclass
@@ -253,11 +257,27 @@ class GmgnAdapter:
         self.client.configured = bool(self.api_key)
         self.banned_until_unix: int = 0
         self.plan_upgrade_required: bool = False
+        self.quote_endpoint_plan_limited: bool = False
+        self.rate_limit_limit: int | None = None
+        self.rate_limit_remaining: int | None = None
+        self.rate_limit_reset: int | None = None
         self.is_demo_public_key: bool = self.api_key == PUBLIC_DEMO_TEST_KEY
 
     @property
     def configured(self) -> bool:
         return bool(self.api_key)
+
+    def rate_limit_telemetry(self) -> dict[str, Any]:
+        return {
+            "configured": self.configured,
+            "is_public_test_key": self.is_demo_public_key,
+            "limit": self.rate_limit_limit,
+            "remaining": self.rate_limit_remaining,
+            "reset_unix": self.rate_limit_reset,
+            "banned_until_unix": self.banned_until_unix if self.banned_until_unix > int(time.time()) else None,
+            "quote_endpoint_plan_limited": self.quote_endpoint_plan_limited,
+            "quote_fallback": "gmgn_amm_reserve_quote" if self.quote_endpoint_plan_limited else "gmgn_quote",
+        }
 
     def snapshot(self) -> ProviderSnapshot:
         snap = self.client.snapshot()
@@ -273,6 +293,11 @@ class GmgnAdapter:
             snap.detail = "Endpoint weight exceeds current GMGN plan tier."
         elif self.is_demo_public_key:
             snap.detail = "Using GMGN public test key (rate-limited, verification only)."
+        elif self.quote_endpoint_plan_limited:
+            snap.detail = (
+                "Read-only Free tier active (rank/info/security/kline HTTP 200; "
+                "/v1/trade/quote weight 11 uses AMM pool-reserve paper quote)."
+            )
         else:
             snap.detail = "Read-only Exist Auth active. Swap signing routes are permanently disabled."
         return snap
@@ -336,8 +361,16 @@ class GmgnAdapter:
             self.client.last_error = str(exc)[:300]
             raise ProviderError("gmgn", str(exc)) from exc
 
+        limit_header = res.headers.get("x-ratelimit-limit")
+        rem_header = res.headers.get("x-ratelimit-remaining")
         reset_header = res.headers.get("x-ratelimit-reset")
+        if limit_header and limit_header.isdigit():
+            self.rate_limit_limit = int(limit_header)
+        if rem_header and rem_header.isdigit():
+            self.rate_limit_remaining = int(rem_header)
         reset_unix = int(reset_header) if reset_header and reset_header.isdigit() else None
+        if reset_unix is not None:
+            self.rate_limit_reset = reset_unix
 
         try:
             envelope = res.json()
@@ -355,11 +388,16 @@ class GmgnAdapter:
         body_reset = envelope.get("reset_at")
         if isinstance(body_reset, (int, float)) and int(body_reset) > 0:
             reset_unix = int(body_reset)
+            self.rate_limit_reset = reset_unix
 
         if res.status_code == 403 and api_error in {"PLAN_UPGRADE_REQUIRED", "PRO_PLAN_REQUIRED"}:
-            self.plan_upgrade_required = True
-            msg = f"GMGN {api_error}: endpoint unavailable on current plan"
-            self.client.last_error = msg
+            if sub_path == "/v1/trade/quote":
+                self.quote_endpoint_plan_limited = True
+            else:
+                self.plan_upgrade_required = True
+            msg = f"GMGN {api_error}: endpoint {sub_path} unavailable on current plan"
+            if sub_path != "/v1/trade/quote":
+                self.client.last_error = msg
             raise ProviderError("gmgn", msg)
 
         if res.status_code == 429 or api_error in {
@@ -393,9 +431,17 @@ class GmgnAdapter:
         data = await self.request_read(
             "GET",
             "/v1/market/rank",
-            params={"chain": "sol", "interval": interval, "limit": min(max(limit, 1), 100), "order_by": "volume"},
+            params={
+                "chain": "sol",
+                "interval": interval,
+                "limit": min(max(limit, 1), 100),
+                "orderby": "volume",
+                "order_by": "volume",
+                "direction": "desc",
+            },
         )
-        items = (data or {}).get("rank") if isinstance(data, dict) else []
+        unwrapped = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+        items = (unwrapped or {}).get("rank") if isinstance(unwrapped, dict) else (unwrapped if isinstance(unwrapped, list) else [])
         rows: list[Observation] = []
         for raw in items or []:
             if not isinstance(raw, dict):
@@ -511,7 +557,13 @@ class GmgnAdapter:
 
         mint_active = (not bool(sec.renounced_mint)) if sec.renounced_mint is not None else None
         freeze_active = (not bool(sec.renounced_freeze_account)) if sec.renounced_freeze_account is not None else None
-        malicious = bool((rug_ratio is not None and rug_ratio >= Decimal("0.75")) or wash is True or (susp_name or susp_sym or susp_desc))
+        honeypot_flag = bool(sec.is_honeypot or sec.honeypot or sec.can_not_sell)
+        malicious = bool(
+            honeypot_flag
+            or (rug_ratio is not None and rug_ratio >= Decimal("0.75"))
+            or wash is True
+            or (susp_name or susp_sym or susp_desc)
+        )
 
         facts = AuthorityFacts(
             source="gmgn_security",
@@ -528,6 +580,7 @@ class GmgnAdapter:
 
         rat_rate = optional_d(sec.rat_trader_amount_rate or stat_obj.get("top_rat_trader_percentage"))
         bundler_rate = optional_d(sec.bundler_trader_amount_rate or stat_obj.get("top_bundler_trader_percentage"))
+        can_sell_ok = not honeypot_flag and sell_tax < Decimal("0.50")
 
         return GmgnDossier(
             mint=address,
@@ -545,6 +598,7 @@ class GmgnAdapter:
             smart_degen_count=tags_obj.get("smart_wallets"),
             sniper_count=sec.sniper_count or tags_obj.get("sniper_wallets"),
             creator_status=sec.creator_token_status or dev_obj.get("creator_token_status"),
+            can_sell_ok=can_sell_ok,
         )
 
     async def token_kline(
@@ -563,26 +617,110 @@ class GmgnAdapter:
         if to_ts is not None:
             params["to"] = to_ts
         data = await self.request_read("GET", "/v1/market/token_kline", params=params)
-        items = (data or {}).get("list") if isinstance(data, dict) else []
+        unwrapped = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+        items = (unwrapped or {}).get("list") if isinstance(unwrapped, dict) else (unwrapped if isinstance(unwrapped, list) else [])
         candles: list[dict] = []
         for row in items or []:
             if not isinstance(row, dict) or row.get("time") is None:
                 continue
-            # GMGN kline naming: `amount` is USD volume; `volume` is token count.
+            raw_ts = int(float(row["time"]))
+            ts_sec = raw_ts // 1000 if raw_ts > 10_000_000_000 else raw_ts
+            close_d = optional_d(row.get("close")) or Decimal("0")
+            vol_d = optional_d(row.get("volume")) or Decimal("0")
+            amt_d = optional_d(row.get("amount")) or Decimal("0")
+            # Live GMGN v1 klines return USD volume in `volume` and token units in `amount`
+            # (so `amount * close ≈ volume`), while older fixtures put USD in `amount` (`volume * close ≈ amount`).
+            if close_d > 0 and vol_d > 0 and amt_d > 0:
+                err_amt_usd = abs(vol_d * close_d - amt_d)
+                err_vol_usd = abs(amt_d * close_d - vol_d)
+                if err_vol_usd < err_amt_usd:
+                    usd_vol_str = str(row.get("volume") or "0")
+                    tok_vol_str = str(row.get("amount") or "0")
+                else:
+                    usd_vol_str = str(row.get("amount") or "0")
+                    tok_vol_str = str(row.get("volume") or "0")
+            else:
+                usd_vol_str = str(row.get("amount") or row.get("volume") or "0")
+                tok_vol_str = str(row.get("volume") or "0")
             candles.append(
                 {
-                    "timestamp": int(row["time"]),
+                    "timestamp": ts_sec,
+                    "at": datetime.fromtimestamp(ts_sec, tz=timezone.utc).isoformat(),
                     "open": str(row.get("open") or "0"),
                     "high": str(row.get("high") or "0"),
                     "low": str(row.get("low") or "0"),
                     "close": str(row.get("close") or "0"),
-                    "volume": str(row.get("amount") or "0"),
-                    "token_volume": str(row.get("volume") or "0"),
+                    "volume": usd_vol_str,
+                    "token_volume": tok_vol_str,
                     "provider": "gmgn",
                 }
             )
         candles.sort(key=lambda item: item["timestamp"])
         return candles
+
+    def amm_reserve_paper_quote(
+        self,
+        *,
+        mint: str,
+        side: str,
+        notional_usd: Decimal,
+        spot_price_usd: Decimal | None,
+        pool_liquidity_usd: Decimal | None,
+        observed_at: datetime,
+        transfer_fee_bps: Decimal | None = None,
+        can_sell_ok: bool = True,
+        slippage_bps: int = 50,
+    ) -> QuoteView | None:
+        """Zero-cost constant-product AMM paper quote from real observed pool reserves when `/v1/trade/quote` is plan-gated."""
+        if spot_price_usd is None or spot_price_usd <= 0 or pool_liquidity_usd is None or pool_liquidity_usd <= 0:
+            return None
+        if notional_usd <= 0:
+            return None
+        if side == "sell" and not can_sell_ok:
+            return QuoteView(
+                price_usd=Decimal("0"),
+                notional_usd=notional_usd,
+                fee_usd=Decimal("0"),
+                fee_bps=Decimal("0"),
+                slippage_bps=Decimal(slippage_bps),
+                price_impact_bps=Decimal("10000"),
+                observed_at=observed_at,
+                side=side,
+                input_mint=mint,
+                output_mint=USDC_MINT,
+                source="gmgn_amm_reserve_quote",
+                available_notional_usd=Decimal("0"),
+                fail=True,
+                fail_reason="GMGN_CANNOT_SELL_OR_HONEYPOT",
+            )
+        half_liq = pool_liquidity_usd / Decimal("2")
+        if half_liq <= 0:
+            return None
+        impact_frac = min(Decimal("0.50"), notional_usd / half_liq)
+        impact_bps = (impact_frac * Decimal("10000")).quantize(Decimal("0.01"))
+        exec_price = (
+            spot_price_usd * (Decimal("1") + impact_frac)
+            if side == "buy"
+            else spot_price_usd * max(Decimal("0.01"), Decimal("1") - impact_frac)
+        )
+        lp_plus_tx_bps = Decimal("30") + (transfer_fee_bps or Decimal("0"))
+        fee_usd = max(Decimal("0.02"), (notional_usd * lp_plus_tx_bps / Decimal("10000"))).quantize(Decimal("0.000001"))
+        fee_bps = ((fee_usd / notional_usd) * Decimal("10000")).quantize(Decimal("0.01"))
+        avail = min(notional_usd, (pool_liquidity_usd * Decimal("0.02")).quantize(Decimal("0.000001")))
+        return QuoteView(
+            price_usd=exec_price,
+            notional_usd=notional_usd,
+            fee_usd=fee_usd,
+            fee_bps=fee_bps,
+            slippage_bps=Decimal(slippage_bps),
+            price_impact_bps=impact_bps,
+            observed_at=observed_at,
+            side=side,
+            input_mint=USDC_MINT if side == "buy" else mint,
+            output_mint=mint if side == "buy" else USDC_MINT,
+            source="gmgn_amm_reserve_quote",
+            available_notional_usd=avail,
+        )
 
     async def paper_quote(
         self,
@@ -596,7 +734,7 @@ class GmgnAdapter:
         slippage_bps: int = 50,
     ) -> QuoteView | None:
         """Fetch a read-only GMGN swap quote for paper simulation. Never submits an order."""
-        if not self.configured:
+        if not self.configured or self.quote_endpoint_plan_limited:
             return None
         data = await self.request_read(
             "GET",

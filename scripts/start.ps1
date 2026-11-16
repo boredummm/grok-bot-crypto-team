@@ -27,7 +27,8 @@ function Set-EnvValue([string]$Name, [string]$Value) {
 
 Set-EnvValue "SOLSWARM_ADMIN_TOKEN" ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
 Set-EnvValue "SOLSWARM_MONITOR_TOKEN" ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
-Write-Host "Admin and monitor tokens are in .env. Paste one into the dashboard. They are not printed here."
+Set-EnvValue "SOLSWARM_MCP_TOKEN" ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
+Write-Host "Admin, monitor, and MCP tokens are in .env. Paste monitor/admin into the dashboard or MCP into Grok Bot. They are not printed here."
 
 if (-not (Test-Path "$Root\.venv")) {
     py -3.12 -m venv "$Root\.venv"

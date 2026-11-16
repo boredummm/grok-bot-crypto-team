@@ -1,31 +1,23 @@
 # Architecture
 
-SOL SWARM is a local paper-trading research desk (`SOL SWARM + JEV`). It never signs or submits Solana transactions.
+SOL SWARM is a zero-additional-cost local paper-trading research desk (`SOL SWARM + JEV`). It never signs or submits Solana transactions.
+
+## Zero-Cost Intelligence & Storage Split
+
+1. **Local Historical SQLite (`data/solswarm.db`)**: Stores all historical market observations (`market_observations`), 5-minute candlesticks (`kline_bars`), replay runs (`backtest_runs`), paper orders/fills, and ledger state on the local Windows PC so cloud storage never grows unbounded.
+2. **Supabase Free Shared Coordination (`backend/app/supabase_coord.py`, `supabase/migrations/20261116000000_sol_swarm_zero_cost.sql`)**: Stores only compact shared coordination rows (`<= 4 KB` payload cap) across `swarm_agent_tasks`, `swarm_agent_findings`, `swarm_agent_heartbeats`, `swarm_decisions`, and `swarm_dashboard_state`, with automatic TTL + row-cap pruning (`swarm_prune_expired_data()`) and live 500 MB headroom monitoring (`swarm_storage_telemetry()`). Falls back seamlessly to local SQLite mirror tables when `SUPABASE_URL` is unconfigured.
+3. **Grok Bot Primary Intelligence + Free Local Deterministic Fallback**:
+   - Grok Bot teammates (`SCAN`, `VET`, `SOCIAL`, `CHIEF`) connect over Tailscale Personal + Tailscale Serve via `POST /api/mcp` (`backend/app/mcp_bridge.py`) or Supabase MCP (`decision_source="grok_bot"`).
+   - When Grok Bot teammates are offline or outside the freshness window (`SOLSWARM_GROK_BOT_FRESHNESS_SECONDS`), the free local deterministic analyzer evaluates candidates and tags every finding, seat card, event, and decision explicitly as `decision_source="deterministic_fallback"`.
+   - TypeSafe JEV (`SOLSWARM_ENABLE_OPTIONAL_JEV=false`) and direct xAI API (`XAI_API_KEY`) are strictly optional and disabled by default (`$0.00/mo` required).
 
 ## Eight-Seat Desk & Funnel
 
-Follows **code fetches, model judges, code decides**:
+Follows **code fetches, Grok Bot (or deterministic fallback) judges, deterministic code decides**:
 
-`GMGN / GeckoTerminal universe -> free_kill (age, liquidity, volume, mcap) -> DexScreener trade_kill -> Solana RPC + GMGN security chain_kill -> optional JEV typed judgements (soft_kill) -> CHIEF pick or NONE -> SIZE -> FILLS (paper quote) -> independent RiskEngine veto & exit monitoring`.
-
-The 2×4 Control Room maps directly to persistent backend state:
-- `CHIEF` (`orchestrator`): coordinates shortlists and final pick-or-stand-down.
-- `SCAN` (`momentum`): runs `free_kill` / `trade_kill` arithmetic and momentum structure.
-- `VET` (`security`): inspects mint/freeze authorities, holder concentration, and contract flags.
-- `SOCIAL`: extracts verified on-chain X handles (`clean_x_handle`) without guessing fan accounts.
-- `SIZE` (`strategy`): deterministic paper ticket sizing (`<=2%` bank, `<=6%` exposure, pool & fee viability).
-- `FILLS` (`execution`): simulates paper fills from read-only GMGN or Jupiter quotes with fee/impact provenance.
-- `RISK` (`risk` + `monitoring`): independent final veto, emergency stop, and exit surveillance.
-- `CRAWLER` (`discovery`): sweeps feeds, tracks rate-limit budgets, and maintains the reason-TTL `BenchEntry` table (`bench_entries`) plus `ShadowDecision` comparison journal (`shadow_decisions`).
-
-Demo mode and live mode remain strictly partitioned in SQLite so fixture trades never enter live analytics.
+`GMGN / GeckoTerminal universe -> CRAWLER evidence & local kline cache -> free_kill -> trade_kill -> Solana RPC + GMGN security chain_kill -> Grok Bot MCP findings/CHIEF pick (or deterministic_fallback) -> SIZE -> independent RiskEngine final veto -> FILLS (paper quote) & exit monitoring`.
 
 ## Providers
 
-- **GMGN OpenAPI (`backend/app/providers/gmgn.py`)**: Isolated read-only adapter using `X-APIKEY` + `timestamp` + per-request `client_id` UUID (`Exist Auth`). All write/swap endpoints (`/v1/trade/swap`, `/v1/trade/multi_swap`, `/v1/trade/strategy/*`, `/v1/cooking/*`) and `X-Signature` headers are blocked at the service boundary. Handles `RATE_LIMIT_BANNED_MAX` (`reset_at` cooldown) and `PLAN_UPGRADE_REQUIRED` without ban-extending retries, sanitizes untrusted token metadata, and cross-checks prices/liquidity against GeckoTerminal and DexScreener.
-- **TypeSafe System One / JEV (`backend/app/jev.py`)**: Typed `noul`, `choice`, and `score` question sets (`POST /v1/systemone`). Validates answer schemas and probability sums, records resolved model IDs (`jev-1.14.0`), never retries HTTP `422`, and reports `JEV NOT CONNECTED` when `TYPESAFE_API_KEY` is absent.
-- **GeckoTerminal, DexScreener, Solana RPC, Jupiter Swap v2 (quote-only)**: Secondary discovery, on-chain mint verification, and quote fallback.
-
-## Tailscale
-
-The process binds to `127.0.0.1`. `scripts/tailscale-serve.ps1` publishes that port privately via Tailscale Serve and aborts if Funnel is enabled.
+- **GMGN OpenAPI (`backend/app/providers/gmgn.py`)**: Isolated read-only adapter using `X-APIKEY` + `timestamp` + per-request `client_id` UUID (`Exist Auth`). Blocks all write/swap endpoints and `X-Signature` headers. Unwraps nested `/v1/market/rank` envelopes, normalizes millisecond `/v1/market/token_kline` bars, tracks `x-ratelimit-*` headers, and falls back to deterministic AMM pool-reserve paper quotes (`gmgn_amm_reserve_quote`) when `/v1/trade/quote` (weight 11) exceeds the GMGN Free-tier limit of 5.
+- **Tailscale Serve (`scripts/tailscale-serve.ps1`)**: Binds FastAPI/Vite to `127.0.0.1` and publishes HTTPS strictly inside the user's Personal tailnet. Tailscale Funnel is forbidden.

@@ -33,7 +33,11 @@ from app.models import (
     SecurityAssessment,
     ShadowDecision,
     StrategyProposal,
+    SwarmAgentFinding,
+    SwarmAgentHeartbeat,
+    SwarmStructuredDecision,
     Token,
+    KlineBar,
 )
 from app.money import q_usdc
 from app.swarm import Swarm, limits_from_config
@@ -184,6 +188,32 @@ def _provider(row: ProviderHealth) -> dict:
         "last_error": row.last_error,
         "detail": row.detail,
     }
+
+
+def _candles_from_klines(kline_rows: list[KlineBar], limit: int = 28) -> list[dict]:
+    pts = kline_rows[-limit:]
+    candles: list[dict] = []
+    for row in pts:
+        open_p = float(row.open_price)
+        high_p = float(row.high_price)
+        low_p = float(row.low_price)
+        close_p = float(row.close_price)
+        vol = float(row.volume_usd) if row.volume_usd is not None else 0.0
+        dt = datetime.fromtimestamp(row.bar_ts, tz=timezone.utc)
+        candles.append(
+            {
+                "at": dt.isoformat(),
+                "time": dt.strftime("%H:%M"),
+                "open": round(open_p, 8),
+                "high": round(high_p, 8),
+                "low": round(low_p, 8),
+                "close": round(close_p, 8),
+                "volume": round(vol, 2),
+                "up": close_p >= open_p,
+                "provider": row.provider,
+            }
+        )
+    return candles
 
 
 def _candles_from_observations(obs_rows: list[MarketObservation], limit: int = 28) -> list[dict]:
@@ -340,12 +370,20 @@ def desk_state(settings: Settings, swarm: Swarm) -> dict[str, Any]:
         featured_candles: list[dict] = []
         featured_checks: list[dict] = []
         if featured:
-            obs_history = session.scalars(
-                select(MarketObservation)
-                .where(MarketObservation.mode == mode, MarketObservation.mint == featured["mint"])
-                .order_by(MarketObservation.observed_at)
+            kline_history = session.scalars(
+                select(KlineBar)
+                .where(KlineBar.mode == mode, KlineBar.mint == featured["mint"])
+                .order_by(KlineBar.bar_ts)
             ).all()
-            featured_candles = _candles_from_observations(obs_history)
+            if kline_history:
+                featured_candles = _candles_from_klines(kline_history)
+            else:
+                obs_history = session.scalars(
+                    select(MarketObservation)
+                    .where(MarketObservation.mode == mode, MarketObservation.mint == featured["mint"])
+                    .order_by(MarketObservation.observed_at)
+                ).all()
+                featured_candles = _candles_from_observations(obs_history)
             liq_val = Decimal(featured["liquidity"]) if featured.get("liquidity") else Decimal("0")
             liq_ok = liq_val >= Decimal(str(hard.get("min_liquidity_usd", 50000)))
             sec_stat = featured["security_status"]
@@ -387,6 +425,17 @@ def desk_state(settings: Settings, swarm: Swarm) -> dict[str, Any]:
             select(AgentEvent).where(AgentEvent.mode == mode).order_by(desc(AgentEvent.created_at)).limit(80)
         ).all()
         health_map = {row.agent_name: row for row in session.scalars(select(AgentHealth)).all()}
+        hb_cutoff = now.timestamp() - max(15, settings.grok_bot_freshness_seconds)
+        swarm_hb_map: dict[str, SwarmAgentHeartbeat] = {}
+        for hb in session.scalars(select(SwarmAgentHeartbeat)).all():
+            if hb.last_seen_at and hb.last_seen_at.timestamp() >= hb_cutoff:
+                swarm_hb_map[hb.seat] = hb
+
+        latest_swarm_dec = session.scalar(
+            select(SwarmStructuredDecision)
+            .where(SwarmStructuredDecision.mode == mode)
+            .order_by(desc(SwarmStructuredDecision.created_at))
+        )
         last_order = session.scalar(
             select(PaperOrder).where(PaperOrder.mode == mode).order_by(desc(PaperOrder.created_at))
         )
@@ -430,6 +479,8 @@ def desk_state(settings: Settings, swarm: Swarm) -> dict[str, Any]:
             active_bench_count=active_bench_count,
             latest_by_seat=latest_by_seat,
             health_map=health_map,
+            swarm_hb_map=swarm_hb_map,
+            latest_swarm_dec=latest_swarm_dec,
             soft=soft,
         )
 
@@ -495,9 +546,17 @@ def desk_state(settings: Settings, swarm: Swarm) -> dict[str, Any]:
             "pick": 1 if funnel_stats.get("picked") else 0,
         }
 
+        active_decision_source = (
+            latest_swarm_dec.decision_source
+            if latest_swarm_dec is not None
+            else ("grok_bot" if any(h.decision_source == "grok_bot" for h in swarm_hb_map.values()) else "deterministic_fallback")
+        )
+
         return {
             "mode": mode,
-            "data_label": "DEMO FIXTURES (PAPER)" if mode == "demo" else "LIVE PROVIDERS (PAPER)",
+            "mode_badge": "DEMO" if mode == "demo" else "LIVE PAPER",
+            "data_label": "DEMO FIXTURES (PAPER)" if mode == "demo" else "LIVE PAPER (REAL GMGN)",
+            "decision_source": active_decision_source,
             "paper_trading": True,
             "live_execution_enabled": False,
             "emergency_stop": paused,
@@ -507,7 +566,7 @@ def desk_state(settings: Settings, swarm: Swarm) -> dict[str, Any]:
             "clock_utc": now.strftime("%H:%M UTC"),
             "jev": {
                 "connected": jev_ok,
-                "configured": bool(settings.typesafe_api_key),
+                "configured": bool(settings.enable_optional_jev and settings.typesafe_api_key),
                 "status_label": f"JEV · {swarm.jev.last_resolved_model or settings.typesafe_model}" if jev_ok else "JEV NOT CONNECTED",
                 "requested_model": settings.typesafe_model,
                 "resolved_model": swarm.jev.last_resolved_model,
@@ -523,8 +582,12 @@ def desk_state(settings: Settings, swarm: Swarm) -> dict[str, Any]:
                 "live_swaps_enabled": False,
             },
             "grok": {
-                "configured": bool(settings.xai_api_key),
-                "status_label": f"GROK ({settings.xai_model})" if settings.xai_api_key else "GROK UNCONFIGURED",
+                "configured": bool(settings.xai_api_key or any(h.decision_source == "grok_bot" for h in swarm_hb_map.values())),
+                "status_label": (
+                    "GROK BOT MCP LIVE"
+                    if any(h.decision_source == "grok_bot" for h in swarm_hb_map.values())
+                    else (f"GROK ({settings.xai_model})" if settings.xai_api_key else "DET FALLBACK ($0)")
+                ),
             },
             "tailscale": tailscale_health(),
             "seats": seats,
@@ -598,6 +661,8 @@ def _build_seats(
     active_bench_count: int,
     latest_by_seat: dict[str, AgentEvent],
     health_map: dict[str, AgentHealth],
+    swarm_hb_map: dict[str, SwarmAgentHeartbeat],
+    latest_swarm_dec: SwarmStructuredDecision | None,
     soft: dict,
 ) -> list[dict[str, Any]]:
     sym = featured["symbol"] if featured else "NONE"
@@ -614,14 +679,37 @@ def _build_seats(
             h.status,
         )
 
+    def _seat_src(seat_key: str) -> str:
+        hb = swarm_hb_map.get(seat_key)
+        if hb and hb.decision_source == "grok_bot":
+            return "grok_bot"
+        if jev_ok and seat_key in {"CHIEF", "SCAN", "VET", "SOCIAL"}:
+            return "optional_jev"
+        if seat_key in {"SIZE", "FILLS", "RISK", "CRAWLER"}:
+            return "deterministic_engine"
+        return "deterministic_fallback"
+
+    chief_src = _seat_src("CHIEF")
+    if latest_swarm_dec and latest_swarm_dec.decision_source == "grok_bot":
+        chief_src = "grok_bot"
+    scan_src = _seat_src("SCAN")
+    vet_src = _seat_src("VET")
+    soc_src = _seat_src("SOCIAL")
+
     chief_ev = latest_by_seat.get("CHIEF")
     chief_hb, chief_proc, chief_err, chief_st = _hb("orchestrator")
+    if "CHIEF" in swarm_hb_map and swarm_hb_map["CHIEF"].decision_source == "grok_bot":
+        chief_hb = swarm_hb_map["CHIEF"].last_seen_at.isoformat()
+        chief_st = swarm_hb_map["CHIEF"].status
     chief_pick_text = f"last pick {picked}" if picked else (f"holding {open_pos[0].mint}" if open_pos else "standing down · no pick")
     if open_pos and featured:
         chief_pick_text = f"last pick {featured['symbol']}"
 
     scan_ev = latest_by_seat.get("SCAN")
     scan_hb, scan_proc, scan_err, scan_st = _hb("momentum")
+    if "SCAN" in swarm_hb_map and swarm_hb_map["SCAN"].decision_source == "grok_bot":
+        scan_hb = swarm_hb_map["SCAN"].last_seen_at.isoformat()
+        scan_st = swarm_hb_map["SCAN"].status
     mom_score = (featured.get("momentum_score") if featured else None)
     scan_norm = round(float(mom_score) / 100.0, 2) if mom_score is not None else None
     scan_jev = ((scan_ev.payload or {}).get("jev_shape") or {}) if scan_ev else {}
@@ -631,11 +719,14 @@ def _build_seats(
         scan_bar = float(scan_jev["probabilities"].get("crowd", 0))
     else:
         scan_val = f"{scan_norm:.2f}" if scan_norm is not None else "—"
-        scan_metric_lbl = f"momentum.det · {sym}"
+        scan_metric_lbl = f"momentum.{'grok' if scan_src == 'grok_bot' else 'det'} · {sym}"
         scan_bar = scan_norm
 
     vet_ev = latest_by_seat.get("VET")
     vet_hb, vet_proc, vet_err, vet_st = _hb("security")
+    if "VET" in swarm_hb_map and swarm_hb_map["VET"].decision_source == "grok_bot":
+        vet_hb = swarm_hb_map["VET"].last_seen_at.isoformat()
+        vet_st = swarm_hb_map["VET"].status
     vet_jev = ((vet_ev.payload or {}).get("jev_dev_loaded") or {}) if vet_ev else {}
     if vet_jev and "noul" in vet_jev:
         vet_val = f"{float(vet_jev['noul']):.2f}"
@@ -657,7 +748,9 @@ def _build_seats(
     fills_ev = latest_by_seat.get("FILLS")
     fills_hb, fills_proc, fills_err, fills_st = _hb("execution")
     if last_order and last_fill:
-        fill_val = f"{last_order.side} ${float(last_fill.notional):.2f} @ ${float(last_fill.price):.2f}"
+        fp = float(last_fill.price)
+        fp_str = f"{fp:.2f}" if fp >= 0.01 else f"{fp:.6g}"
+        fill_val = f"{last_order.side} ${float(last_fill.notional):.2f} @ ${fp_str}"
         fill_log = f"fee ${float(last_fill.fee):.2f} ({last_fill.fee_source}) · paper only"
         fill_bar = 1.0
     elif last_order and last_order.status != "filled":
@@ -686,16 +779,25 @@ def _build_seats(
         {
             "seat": "CHIEF",
             "subtitle": "never takes a position",
-            "badge": "JEV PICK" if jev_ok else "JEV OFF · DET",
-            "jev_connected": jev_ok,
+            "badge": "GROK BOT" if chief_src == "grok_bot" else ("JEV PICK" if jev_ok else "DET FALLBACK"),
+            "jev_connected": jev_ok or chief_src == "grok_bot",
+            "decision_source": chief_src,
             "status": "paused" if paused else chief_st,
-            "metric_label": "question set · pick" if jev_ok else "mode · deterministic",
+            "metric_label": (
+                "source · grok_bot"
+                if chief_src == "grok_bot"
+                else ("question set · pick" if jev_ok else "source · det_fallback")
+            ),
             "metric_value": chief_pick_text,
             "bar_ratio": 0.75 if picked else 0.25,
             "log_line": (
-                f"worth >= {soft.get('pick_min_worth', 0.60):.2f} · conf >= {soft.get('pick_min_conf', 0.55):.2f}"
-                if jev_ok
-                else "JEV NOT CONNECTED · deterministic strategy gate"
+                latest_swarm_dec.thesis[:92]
+                if (chief_src == "grok_bot" and latest_swarm_dec)
+                else (
+                    f"worth >= {soft.get('pick_min_worth', 0.60):.2f} · conf >= {soft.get('pick_min_conf', 0.55):.2f}"
+                    if jev_ok
+                    else "deterministic_fallback · $0 local strategy gate"
+                )
             ),
             "speech_bubble": f"pick: {picked}" if picked else None,
             "target_station": "chief",
@@ -708,8 +810,9 @@ def _build_seats(
         {
             "seat": "SCAN",
             "subtitle": "finding what moves",
-            "badge": "ASKS JEV" if jev_ok else "MATH ONLY",
-            "jev_connected": jev_ok,
+            "badge": "GROK BOT" if scan_src == "grok_bot" else ("ASKS JEV" if jev_ok else "DET FALLBACK"),
+            "jev_connected": jev_ok or scan_src == "grok_bot",
+            "decision_source": scan_src,
             "status": scan_st,
             "metric_label": scan_metric_lbl,
             "metric_value": scan_val,
@@ -730,8 +833,9 @@ def _build_seats(
         {
             "seat": "VET",
             "subtitle": "chain risk, is it real",
-            "badge": "ASKS JEV" if jev_ok else "RPC + GMGN",
-            "jev_connected": jev_ok,
+            "badge": "GROK BOT" if vet_src == "grok_bot" else ("ASKS JEV" if jev_ok else "RPC + GMGN"),
+            "jev_connected": jev_ok or vet_src == "grok_bot",
+            "decision_source": vet_src,
             "status": vet_st,
             "metric_label": vet_lbl,
             "metric_value": vet_val,
@@ -754,18 +858,27 @@ def _build_seats(
         {
             "seat": "SOCIAL",
             "subtitle": "the project's X account",
-            "badge": "ASKS JEV" if jev_ok else "HANDLE ONLY",
-            "jev_connected": jev_ok,
-            "status": "unconfigured" if not jev_ok else "idle",
+            "badge": "GROK BOT" if soc_src == "grok_bot" else ("ASKS JEV" if jev_ok else "HANDLE ONLY"),
+            "jev_connected": jev_ok or soc_src == "grok_bot",
+            "decision_source": soc_src,
+            "status": "online" if soc_src == "grok_bot" else ("unconfigured" if not jev_ok else "idle"),
             "metric_label": soc_lbl,
             "metric_value": soc_val,
-            "bar_ratio": 0.5 if x_handle else 0.0,
-            "log_line": soc_payload.get("note") or "no X feed plugin · never guesses fan accounts",
+            "bar_ratio": 0.75 if soc_src == "grok_bot" else (0.5 if x_handle else 0.0),
+            "log_line": (
+                swarm_hb_map["SOCIAL"].note
+                if ("SOCIAL" in swarm_hb_map and swarm_hb_map["SOCIAL"].decision_source == "grok_bot" and swarm_hb_map["SOCIAL"].note)
+                else (soc_payload.get("note") or "no X feed plugin · never guesses fan accounts")
+            ),
             "speech_bubble": f"handle @{x_handle}" if x_handle else None,
             "target_station": "desk",
             "active_mint": featured["mint"] if featured else None,
             "active_symbol": sym,
-            "last_heartbeat": soc_ev.created_at.isoformat() if soc_ev else None,
+            "last_heartbeat": (
+                swarm_hb_map["SOCIAL"].last_seen_at.isoformat()
+                if "SOCIAL" in swarm_hb_map
+                else (soc_ev.created_at.isoformat() if soc_ev else None)
+            ),
             "processed": crawl_proc,
             "errors": 0,
         },
@@ -774,6 +887,7 @@ def _build_seats(
             "subtitle": "how much",
             "badge": "MATH",
             "jev_connected": False,
+            "decision_source": "deterministic_engine",
             "status": size_st,
             "metric_label": f"ticket {ticket_pct}%",
             "metric_value": f"${float(max_ticket):,.2f}",
@@ -792,6 +906,7 @@ def _build_seats(
             "subtitle": "execution (paper)",
             "badge": "GMGN PAPER",
             "jev_connected": False,
+            "decision_source": "deterministic_engine",
             "status": fills_st,
             "metric_label": "last paper fill",
             "metric_value": fill_val,
@@ -810,6 +925,7 @@ def _build_seats(
             "subtitle": "closing & final veto",
             "badge": "FINAL VETO",
             "jev_connected": False,
+            "decision_source": "deterministic_engine",
             "status": "paused" if paused else risk_st,
             "metric_label": f"open {len(open_pos)} · closed",
             "metric_value": f"{wins}W {losses}L",
@@ -828,6 +944,7 @@ def _build_seats(
             "subtitle": "reads first, then the desk trades",
             "badge": f"TAPS {evaluated}/{max(seen, evaluated, 1)}",
             "jev_connected": False,
+            "decision_source": "deterministic_engine",
             "status": crawl_st,
             "metric_label": "observations",
             "metric_value": str(total_obs_count),
@@ -1173,6 +1290,11 @@ def token_detail(mint: str) -> dict | None:
             .where(StrategyProposal.mode == mode, StrategyProposal.mint == mint)
             .order_by(desc(StrategyProposal.created_at))
         ).all()
+        klines = session.scalars(
+            select(KlineBar)
+            .where(KlineBar.mode == mode, KlineBar.mint == mint)
+            .order_by(KlineBar.bar_ts)
+        ).all()
         latest = observations[-1] if observations else None
         return {
             "mint": token.mint,
@@ -1206,7 +1328,7 @@ def token_detail(mint: str) -> dict | None:
                 for row in observations
                 if row.price_usd is not None
             ],
-            "candles": _candles_from_observations(observations),
+            "candles": _candles_from_klines(klines) if klines else _candles_from_observations(observations),
             "security": [
                 {
                     "at": row.observed_at.isoformat(),
@@ -1373,7 +1495,8 @@ def settings_view(settings: Settings) -> dict:
             },
             "providers": {
                 "gmgn_configured": bool(settings.gmgn_api_key),
-                "typesafe_jev_configured": bool(settings.typesafe_api_key),
+                "supabase_configured": settings.supabase_configured,
+                "typesafe_jev_configured": bool(settings.enable_optional_jev and settings.typesafe_api_key),
                 "jupiter_configured": bool(settings.jupiter_api_key),
                 "birdeye_configured": bool(settings.birdeye_api_key),
                 "solana_rpc_configured": bool(settings.solana_rpc_url),
@@ -1443,3 +1566,68 @@ def backtest_detail(run_id: str) -> dict | None:
             "results": row.results,
             "strategy": row.strategy_version,
         }
+
+
+def coordination_state(swarm: Swarm) -> dict[str, Any]:
+    with session_scope() as session:
+        mode = _mode(session)
+        findings = session.scalars(
+            select(SwarmAgentFinding).where(SwarmAgentFinding.mode == mode).order_by(desc(SwarmAgentFinding.created_at)).limit(40)
+        ).all()
+        decisions_rows = session.scalars(
+            select(SwarmStructuredDecision).where(SwarmStructuredDecision.mode == mode).order_by(desc(SwarmStructuredDecision.created_at)).limit(40)
+        ).all()
+        hbs = session.scalars(select(SwarmAgentHeartbeat).order_by(SwarmAgentHeartbeat.seat)).all()
+    return {
+        "mode": mode,
+        "tasks": swarm.coord.list_pending_tasks(mode=mode, limit=30),
+        "heartbeats": [
+            {
+                "seat": h.seat,
+                "status": h.status,
+                "decision_source": h.decision_source,
+                "active_mint": h.active_mint,
+                "active_symbol": h.active_symbol,
+                "agent_id": h.agent_id,
+                "note": h.note,
+                "last_seen_at": h.last_seen_at.isoformat(),
+                "expires_at": h.expires_at.isoformat(),
+            }
+            for h in hbs
+        ],
+        "findings": [
+            {
+                "id": f.id,
+                "seat": f.seat,
+                "mint": f.mint,
+                "symbol": f.symbol,
+                "verdict": f.verdict,
+                "decision_source": f.decision_source,
+                "confidence": _s(f.confidence),
+                "score": f.score,
+                "summary": f.summary,
+                "agent_id": f.agent_id,
+                "created_at": f.created_at.isoformat(),
+            }
+            for f in findings
+        ],
+        "decisions": [
+            {
+                "id": d.id,
+                "cycle_id": d.cycle_id,
+                "mint": d.mint,
+                "symbol": d.symbol,
+                "action": d.action,
+                "decision_source": d.decision_source,
+                "confidence": _s(d.confidence),
+                "size_factor": _s(d.size_factor),
+                "thesis": d.thesis,
+                "reasons": d.reasons,
+                "risk_approved": d.risk_approved,
+                "risk_reason_codes": d.risk_reason_codes,
+                "paper_order_id": d.paper_order_id,
+                "created_at": d.created_at.isoformat(),
+            }
+            for d in decisions_rows
+        ],
+    }

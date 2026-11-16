@@ -48,6 +48,7 @@ from app.models import (
     ConfigVersion,
     EquitySnapshot,
     FunnelRun,
+    KlineBar,
     LedgerEntry,
     LiquidityPool,
     MarketObservation,
@@ -62,13 +63,14 @@ from app.models import (
     StrategyProposal,
     Token,
 )
-from app.money import USDC_MINT, q_usdc
+from app.money import USDC_MINT, optional_d, q_usdc
 from app.providers.gmgn import GmgnAdapter, GmgnDossier, clean_x_handle, compare_provider_evidence
 from app.providers.http import ProviderClient, ProviderError, ProviderSnapshot
 from app.providers.jupiter import JupiterAdapter
 from app.providers.normalize import parse_boosted_mints, parse_dexscreener_pairs, parse_geckoterminal_pools
 from app.providers.solana import SolanaRpc
 from app.risk import PortfolioView, ProposalView, QuoteView, RiskLimits, SecurityView, evaluate_entry
+from app.supabase_coord import SupabaseCoordinator
 
 log = logging.getLogger(__name__)
 
@@ -160,9 +162,11 @@ class Swarm:
         rpc: SolanaRpc | None = None,
         jev: JevClient | None = None,
         grok: GrokClient | None = None,
+        coord: SupabaseCoordinator | None = None,
     ) -> None:
         self.settings = settings
-        self.gecko = gecko or ProviderClient("geckoterminal", per_minute=8)
+        self.gecko = gecko or ProviderClient("gecko", per_minute=8)
+        self.gecko.name = "geckoterminal"
         self.dex = dex or ProviderClient("dexscreener", per_minute=60)
         self.gmgn = gmgn or GmgnAdapter(
             ProviderClient("gmgn", per_minute=20),
@@ -175,9 +179,10 @@ class Swarm:
             settings.jupiter_base,
         )
         self.rpc = rpc or SolanaRpc(ProviderClient("solana_rpc", per_minute=20), settings.solana_rpc_url)
+        effective_jev_key = settings.typesafe_api_key if settings.enable_optional_jev else ""
         self.jev = jev or JevClient(
             ProviderClient("jev", per_minute=30),
-            settings.typesafe_api_key,
+            effective_jev_key,
             settings.typesafe_model,
             settings.typesafe_base_url,
         )
@@ -188,6 +193,7 @@ class Swarm:
             settings.xai_base_url,
             settings.ai_hourly_budget,
         )
+        self.coord = coord or SupabaseCoordinator(settings)
         self.momentum_delay = 0.0
         self._sequence: dict[str, int] = {}
 
@@ -199,6 +205,7 @@ class Swarm:
         await self.rpc.client.aclose()
         await self.jev.client.aclose()
         await self.grok.client.aclose()
+        await self.coord.aclose()
 
     def bootstrap(self) -> None:
         from app.db import Base, get_engine
@@ -211,6 +218,8 @@ class Swarm:
                 session.add(SchemaMigration(version=1, applied_at=utcnow()))
             if session.get(SchemaMigration, 2) is None:
                 session.add(SchemaMigration(version=2, applied_at=utcnow()))
+            if session.get(SchemaMigration, 3) is None:
+                session.add(SchemaMigration(version=3, applied_at=utcnow()))
             runtime = session.get(AppSetting, "runtime")
             if runtime is None:
                 config = dict(DEFAULT_CONFIG)
@@ -633,12 +642,17 @@ class Swarm:
         notional: Decimal,
         decimals: int,
         now: datetime,
+        *,
+        pool_liquidity_usd: Decimal | None = None,
+        transfer_fee_bps: Decimal | None = None,
+        can_sell_ok: bool = True,
     ) -> QuoteView | None:
         if mode == "demo":
             if price is None:
                 return None
             return demo_quote(now, mint, side, price, notional)
-        # Prefer GMGN paper quote when GMGN_API_KEY is configured, fallback to Jupiter Swap v2 quote.
+        # Prefer GMGN paper quote when GMGN_API_KEY is configured, fallback to Jupiter Swap v2 quote,
+        # and on GMGN Free tier (where /v1/trade/quote weight=11 > limit=5) fall back to deterministic AMM pool reserves.
         if side == "buy":
             amount = int((notional * Decimal("1000000")).to_integral_value())
             input_mint, output_mint = USDC_MINT, mint
@@ -663,16 +677,84 @@ class Swarm:
             except ProviderError as exc:
                 log.warning("gmgn paper quote unavailable: %s", exc.message)
 
-        if not self.jupiter.client.configured:
-            return None
-        return await self.jupiter.order_quote(
-            input_mint=input_mint,
-            output_mint=output_mint,
-            amount_base_units=amount,
-            side=side,
-            observed_at=now,
-            decimals_out=decimals,
-        )
+        if self.jupiter.client.configured:
+            jup_q = await self.jupiter.order_quote(
+                input_mint=input_mint,
+                output_mint=output_mint,
+                amount_base_units=amount,
+                side=side,
+                observed_at=now,
+                decimals_out=decimals,
+            )
+            if jup_q is not None:
+                return jup_q
+
+        if self.gmgn.configured and self.gmgn.quote_endpoint_plan_limited:
+            return self.gmgn.amm_reserve_paper_quote(
+                mint=mint,
+                side=side,
+                notional_usd=notional,
+                spot_price_usd=price,
+                pool_liquidity_usd=pool_liquidity_usd,
+                observed_at=now,
+                transfer_fee_bps=transfer_fee_bps,
+                can_sell_ok=can_sell_ok,
+            )
+
+        return None
+
+    def _cache_local_klines(self, mode: str, mint: str, candles: list[dict], now: datetime, resolution: str = "5m") -> int:
+        """Persist OHLCV kline bars strictly in local SQLite (never sent to Supabase Free)."""
+        stored = 0
+        if not candles:
+            return 0
+        with session_scope() as session:
+            for bar in candles[-48:]:
+                ts = int(bar.get("timestamp") or 0)
+                if ts <= 0:
+                    continue
+                o_p = optional_d(bar.get("open"))
+                h_p = optional_d(bar.get("high"))
+                l_p = optional_d(bar.get("low"))
+                c_p = optional_d(bar.get("close"))
+                if o_p is None or h_p is None or l_p is None or c_p is None:
+                    continue
+                v_usd = optional_d(bar.get("volume")) or Decimal("0")
+                t_vol = optional_d(bar.get("token_volume")) or Decimal("0")
+                existing = session.scalar(
+                    select(KlineBar).where(
+                        KlineBar.mode == mode,
+                        KlineBar.mint == mint,
+                        KlineBar.resolution == resolution,
+                        KlineBar.bar_ts == ts,
+                    )
+                )
+                if existing is None:
+                    session.add(
+                        KlineBar(
+                            mode=mode,
+                            mint=mint,
+                            resolution=resolution,
+                            bar_ts=ts,
+                            open_price=o_p,
+                            high_price=h_p,
+                            low_price=l_p,
+                            close_price=c_p,
+                            volume_usd=v_usd,
+                            token_volume=t_vol,
+                            provider=str(bar.get("provider") or "gmgn")[:32],
+                            observed_at=now,
+                        )
+                    )
+                    stored += 1
+                else:
+                    existing.high_price = h_p
+                    existing.low_price = l_p
+                    existing.close_price = c_p
+                    existing.volume_usd = v_usd
+                    existing.token_volume = t_vol
+                    existing.observed_at = now
+        return stored
 
     async def _facts_and_dossier(
         self,
@@ -777,6 +859,8 @@ class Swarm:
                 tok = session.scalar(select(Token).where(Token.mode == mode, Token.mint == held_pos.mint))
                 held_symbol = tok.symbol if tok else held_pos.mint
 
+        await self.coord.pull_remote_grok_bot_updates(mode=mode, now=now)
+
         # Optional strict guide rule: when `one_position_at_a_time` is enabled and a position is held,
         # skip scanning and run RISK exit monitoring only.
         if one_at_a_time and held_symbol and observations is None:
@@ -863,10 +947,23 @@ class Swarm:
                 },
             )
 
+        await self.coord.record_heartbeat(
+            seat="CRAWLER",
+            status="online",
+            decision_source="deterministic_engine",
+            mode=mode,
+            active_mint=scored[0].mint if scored else None,
+            active_symbol=scored[0].symbol if scored else None,
+            agent_id="local-crawler",
+            note=f"swept {len(raw_rows)} pools -> {len(scored)} candidates",
+            now=now,
+        )
+
         quotes_by_mint: dict[str, QuoteView | None] = {}
         jev_survivors: list[tuple[Observation, dict, str]] = []
+        cycle_primary_source = "deterministic_fallback"
 
-        for row in scored:
+        for idx_cand, row in enumerate(scored):
             correlation_id = str(uuid.uuid4())
             score = discovery_score(row, now)
             with session_scope() as session:
@@ -912,23 +1009,43 @@ class Swarm:
                 )
                 self._touch(session, "discovery", f"scan {row.symbol}", f"score {score}", now, now)
 
-            # Record deterministic funnel stage classifications (`free_kill`, `trade_kill`) for `thresholds.py` telemetry.
-            fk = free_kill(row, now, hard)
-            tk = None if fk else trade_kill(row, hard)
-            if fk:
-                funnel_stats["free"][fk] = funnel_stats["free"].get(fk, 0) + 1
-            elif tk:
-                funnel_stats["trade"][tk] = funnel_stats["trade"].get(tk, 0) + 1
-
             async def _momentum():
                 if self.momentum_delay:
                     await asyncio.sleep(self.momentum_delay)
                 return momentum_from_observations(row, previous, now)
 
             async def _security():
+                authority, dossier, x_handle = await self._facts_and_dossier(mode, row, now, facts)
+                if dossier and dossier.observation:
+                    d_obs = dossier.observation
+                    if d_obs.volume_m5 is not None:
+                        row.volume_m5 = d_obs.volume_m5
+                    if d_obs.volume_h1 is not None:
+                        row.volume_h1 = d_obs.volume_h1
+                    if d_obs.buys_m5 is not None:
+                        row.buys_m5 = d_obs.buys_m5
+                    if d_obs.sells_m5 is not None:
+                        row.sells_m5 = d_obs.sells_m5
+                    if d_obs.buys_h1 is not None:
+                        row.buys_h1 = d_obs.buys_h1
+                    if d_obs.sells_h1 is not None:
+                        row.sells_h1 = d_obs.sells_h1
+                    if d_obs.price_change_m5 is not None:
+                        row.price_change_m5 = d_obs.price_change_m5
+                    if d_obs.price_change_h1 is not None:
+                        row.price_change_h1 = d_obs.price_change_h1
+                    if d_obs.pool_liquidity_usd is not None:
+                        row.pool_liquidity_usd = d_obs.pool_liquidity_usd
+                    if d_obs.pool_address and row.pool_address.startswith("gmgn:"):
+                        row.pool_address = d_obs.pool_address
+                    if d_obs.pool_created_at and row.pool_created_at is None:
+                        row.pool_created_at = d_obs.pool_created_at
+
                 route_map = exit_routes if exit_routes is not None else (demo_exit_routes() if mode == "demo" else {})
                 known_route = route_map.get(row.mint)
                 quote = None
+                tf_bps = authority.transfer_fee_bps if authority else None
+                can_sell = dossier.can_sell_ok if dossier else True
                 if mode == "demo":
                     quote = demo_quote(now, row.mint, "buy", row.price_usd or Decimal("1"))
                     sell = demo_quote(now, row.mint, "sell", row.price_usd or Decimal("1"))
@@ -938,12 +1055,33 @@ class Swarm:
                     exit_ok = known_route
                     _ = sell
                 else:
-                    quote = await self._quote(mode, row.mint, "buy", row.price_usd, Decimal("20"), row.decimals, now)
-                    sell = await self._quote(mode, row.mint, "sell", row.price_usd, Decimal("1"), row.decimals, now)
+                    quote = await self._quote(
+                        mode,
+                        row.mint,
+                        "buy",
+                        row.price_usd,
+                        Decimal("20"),
+                        row.decimals,
+                        now,
+                        pool_liquidity_usd=row.pool_liquidity_usd,
+                        transfer_fee_bps=tf_bps,
+                        can_sell_ok=can_sell,
+                    )
+                    sell = await self._quote(
+                        mode,
+                        row.mint,
+                        "sell",
+                        row.price_usd,
+                        Decimal("1"),
+                        row.decimals,
+                        now,
+                        pool_liquidity_usd=row.pool_liquidity_usd,
+                        transfer_fee_bps=tf_bps,
+                        can_sell_ok=can_sell,
+                    )
                     quotes_by_mint[row.mint] = quote
                     has_quote_provider = self.gmgn.configured or self.jupiter.client.configured
                     exit_ok = bool(sell and not sell.fail) if sell is not None else (False if has_quote_provider else None)
-                authority, dossier, x_handle = await self._facts_and_dossier(mode, row, now, facts)
                 return (
                     classify_security(
                         authority,
@@ -982,6 +1120,25 @@ class Swarm:
                 continue
             t_anal_done = utcnow()
 
+            if dossier and dossier.observation:
+                momentum = momentum_from_observations(row, previous, now)
+
+            # Cache real 5m klines strictly in local SQLite for top live GMGN candidate (never sent to Supabase).
+            if mode == "live" and self.gmgn.configured and idx_cand == 0:
+                try:
+                    klines = await self.gmgn.token_kline(row.mint, resolution="5m")
+                    self._cache_local_klines(mode, row.mint, klines, now, resolution="5m")
+                except ProviderError as exc:
+                    log.warning("gmgn kline cache skipped for %s: %s", row.symbol, exc.message)
+
+            # Record deterministic funnel stage classifications (`free_kill`, `trade_kill`, `chain_kill`).
+            fk = free_kill(row, now, hard)
+            tk = None if fk else trade_kill(row, hard)
+            if fk:
+                funnel_stats["free"][fk] = funnel_stats["free"].get(fk, 0) + 1
+            elif tk:
+                funnel_stats["trade"][tk] = funnel_stats["trade"].get(tk, 0) + 1
+
             funnel_stats["webs_spun"] += 1
             ck = None
             if not fk and not tk:
@@ -997,11 +1154,44 @@ class Swarm:
             if security.classification == "fail":
                 funnel_stats["rugs_killed"] += 1
 
-            # Optional JEV System One typed judgements (never faked when TYPESAFE_API_KEY is absent).
+            # Enqueue compact coordination tasks for Grok Bot teammates when candidate survives hard chain kills.
+            if not (fk or tk or ck):
+                await self.coord.enqueue_candidate_tasks(
+                    cycle_id=cycle_id,
+                    mode=mode,
+                    mint=row.mint,
+                    symbol=row.symbol,
+                    evidence_summary={
+                        "price_usd": format(row.price_usd, "f") if row.price_usd is not None else None,
+                        "liquidity_usd": format(row.pool_liquidity_usd, "f") if row.pool_liquidity_usd is not None else None,
+                        "market_cap_usd": format(row.market_cap_usd, "f") if row.market_cap_usd is not None else None,
+                        "volume_m5": format(row.volume_m5, "f") if row.volume_m5 is not None else None,
+                        "volume_h1": format(row.volume_h1, "f") if row.volume_h1 is not None else None,
+                        "buys_m5": row.buys_m5,
+                        "sells_m5": row.sells_m5,
+                        "momentum_score": momentum.score,
+                        "security_classification": security.classification,
+                        "critical_flags": security.critical_flags,
+                        "onchain_x_handle": x_handle,
+                    },
+                    priority=score,
+                    now=now,
+                )
+
+            grok_intel = self.coord.fresh_grok_bot_intelligence(mode=mode, mint=row.mint, now=now)
+            grok_findings = grok_intel["findings"]
+            grok_chief = grok_intel["chief"]
+            grok_kill_reason: str | None = None
+            for g_seat, g_fnd in grok_findings.items():
+                if g_fnd["verdict"] == "kill":
+                    grok_kill_reason = f"grok_bot_{g_seat.lower()}_kill"
+                    break
+
+            # Optional JEV System One typed judgements (disabled by default unless SOLSWARM_ENABLE_OPTIONAL_JEV=true).
             jev_answers: dict = {}
             jev_model_used: str | None = None
             sk: str | None = None
-            if self.jev.available and mode == "live" and not (fk or tk or ck):
+            if (not grok_intel["has_grok_bot"]) and self.jev.available and mode == "live" and not (fk or tk or ck):
                 try:
                     market_state = {
                         "ticker": row.symbol,
@@ -1043,10 +1233,95 @@ class Swarm:
                 except ProviderError as exc:
                     log.warning("jev judgement failed for %s: %s", row.symbol, exc.message)
 
+            decision_source = (
+                "grok_bot"
+                if grok_intel["has_grok_bot"]
+                else ("optional_jev" if jev_model_used else "deterministic_fallback")
+            )
+            if decision_source == "grok_bot":
+                cycle_primary_source = "grok_bot"
+            elif decision_source == "optional_jev" and cycle_primary_source != "grok_bot":
+                cycle_primary_source = "optional_jev"
+
+            # Record compact deterministic fallback findings when Grok Bot teammates are offline/stale.
+            if decision_source == "deterministic_fallback":
+                await self.coord.record_finding(
+                    mode=mode,
+                    seat="SCAN",
+                    mint=row.mint,
+                    symbol=row.symbol,
+                    decision_source="deterministic_fallback",
+                    verdict="kill" if (fk or tk) else ("pass" if momentum.direction == "bullish" else "warn"),
+                    confidence=Decimal(str(round(momentum.confidence, 4))),
+                    score=momentum.score,
+                    summary=f"[deterministic_fallback] {momentum.direction} ({momentum.score}) · {(fk or tk or 'passed hard flow')}",
+                    finding_payload={"direction": momentum.direction, "free_kill": fk, "trade_kill": tk},
+                    cycle_id=cycle_id,
+                    agent_id="local-deterministic-scan",
+                    now=now,
+                )
+                await self.coord.record_finding(
+                    mode=mode,
+                    seat="VET",
+                    mint=row.mint,
+                    symbol=row.symbol,
+                    decision_source="deterministic_fallback",
+                    verdict="pass" if security.classification == "pass" else ("kill" if security.classification == "fail" else "warn"),
+                    confidence=Decimal("1.0"),
+                    score=security.score,
+                    summary=f"[deterministic_fallback] {security.classification} · {security.explanation[:160]}",
+                    finding_payload={"critical_flags": security.critical_flags, "chain_kill": ck},
+                    cycle_id=cycle_id,
+                    agent_id="local-deterministic-vet",
+                    now=now,
+                )
+                await self.coord.record_finding(
+                    mode=mode,
+                    seat="SOCIAL",
+                    mint=row.mint,
+                    symbol=row.symbol,
+                    decision_source="deterministic_fallback",
+                    verdict="pass" if x_handle else "warn",
+                    confidence=Decimal("0.70") if x_handle else Decimal("0.40"),
+                    score=70 if x_handle else 40,
+                    summary=(
+                        f"[deterministic_fallback] Verified on-chain X @{x_handle}"
+                        if x_handle
+                        else "[deterministic_fallback] No verified on-chain X handle; conservative ticket retained"
+                    ),
+                    finding_payload={"verified_x_handle": x_handle},
+                    cycle_id=cycle_id,
+                    agent_id="local-deterministic-social",
+                    now=now,
+                )
+
+            eff_size_factor = Decimal("1.0")
+            if "SOCIAL" in grok_findings:
+                rec_sf = (grok_findings["SOCIAL"].get("payload") or {}).get("recommended_size_factor")
+                if rec_sf is not None:
+                    eff_size_factor = min(eff_size_factor, Decimal(str(rec_sf)))
+            if grok_chief is not None:
+                eff_size_factor = min(eff_size_factor, Decimal(str(grok_chief["size_factor"])))
+
             with session_scope() as session:
                 # Record bench entry for rejected tokens so bench view and optional skip logic stay accurate.
-                bench_reason = fk or tk or ck or sk or (security.critical_flags[0] if security.classification == "fail" and security.critical_flags else None)
-                bench_stage = "free_kill" if fk else ("trade_kill" if tk else ("chain_kill" if ck else ("soft_kill" if sk else "security")))
+                bench_reason = (
+                    fk
+                    or tk
+                    or ck
+                    or grok_kill_reason
+                    or sk
+                    or (security.critical_flags[0] if security.classification == "fail" and security.critical_flags else None)
+                )
+                bench_stage = (
+                    "free_kill"
+                    if fk
+                    else (
+                        "trade_kill"
+                        if tk
+                        else ("chain_kill" if ck else ("soft_kill" if (sk or grok_kill_reason) else "security"))
+                    )
+                )
                 if bench_reason:
                     self._sit_bench(
                         session,
@@ -1056,14 +1331,14 @@ class Swarm:
                         reason=bench_reason,
                         stage=bench_stage,
                         now=now,
-                        details={"symbol": row.symbol, "flags": security.critical_flags},
+                        details={"symbol": row.symbol, "flags": security.critical_flags, "decision_source": decision_source},
                     )
 
                 self._touch(
                     session,
                     "momentum",
                     f"analyze {row.symbol}",
-                    f"{momentum.direction} ({momentum.score})",
+                    f"{momentum.direction} ({momentum.score}) [{decision_source}]",
                     t_anal_start,
                     t_anal_done,
                 )
@@ -1071,7 +1346,7 @@ class Swarm:
                     session,
                     "security",
                     f"vet {row.symbol}",
-                    f"{security.classification} ({security.score})",
+                    f"{security.classification} ({security.score}) [{decision_source}]",
                     t_anal_start,
                     t_anal_done,
                 )
@@ -1087,17 +1362,18 @@ class Swarm:
                         "seat": "SCAN",
                         "phase": "trade_kill" if tk else ("free_kill" if fk else "momentum"),
                         "symbol": row.symbol,
-                        "score": momentum.score,
+                        "score": grok_findings["SCAN"]["score"] if "SCAN" in grok_findings and grok_findings["SCAN"]["score"] is not None else momentum.score,
                         "direction": momentum.direction,
                         "completeness": momentum.completeness,
                         "confidence": momentum.confidence,
-                        "reasons": momentum.reasons,
+                        "reasons": [grok_findings["SCAN"]["summary"]] if "SCAN" in grok_findings else momentum.reasons,
                         "indicators": momentum.indicators,
                         "free_kill": fk,
                         "trade_kill": tk,
                         "jev_shape": jev_answers.get("shape"),
                         "jev_model": jev_model_used,
-                        "source": "jev+deterministic" if jev_model_used else "deterministic",
+                        "decision_source": "grok_bot" if "SCAN" in grok_findings else decision_source,
+                        "source": "grok_bot" if "SCAN" in grok_findings else ("jev+deterministic" if jev_model_used else "deterministic_fallback"),
                     },
                 )
                 session.add(
@@ -1132,15 +1408,16 @@ class Swarm:
                         "warning_flags": security.warning_flags,
                         "chain_kill": ck,
                         "top_holder_pct": format(authority.top_holder_pct, "f") if authority and authority.top_holder_pct is not None else None,
-                        "explanation": security.explanation,
+                        "explanation": grok_findings["VET"]["summary"] if "VET" in grok_findings else security.explanation,
                         "jev_authority": jev_answers.get("authority_risk"),
                         "jev_concentration": jev_answers.get("concentration_is_exit_risk"),
                         "jev_dev_loaded": jev_answers.get("dev_still_loaded"),
                         "jev_model": jev_model_used,
-                        "source": "jev+deterministic" if jev_model_used else "deterministic",
+                        "decision_source": "grok_bot" if "VET" in grok_findings else decision_source,
+                        "source": "grok_bot" if "VET" in grok_findings else ("jev+deterministic" if jev_model_used else "deterministic_fallback"),
                     },
                 )
-                # SOCIAL seat event: strictly reports verified on-chain X handle or honest missing/unconfigured state.
+                # SOCIAL seat event: strictly reports verified on-chain X handle or Grok Bot verified analysis.
                 self._emit(
                     session,
                     source="discovery",
@@ -1154,14 +1431,23 @@ class Swarm:
                         "phase": "social",
                         "symbol": row.symbol,
                         "x_handle": x_handle,
-                        "status": "handle_verified_plugin_unconfigured" if x_handle else "no_verified_handle",
-                        "note": (
-                            f"On-chain X handle @{x_handle} verified; live X feed plugin not connected."
-                            if x_handle
-                            else "No verified on-chain X handle. Fan-account search is disabled."
+                        "status": (
+                            f"grok_bot_{grok_findings['SOCIAL']['verdict']}"
+                            if "SOCIAL" in grok_findings
+                            else ("handle_verified_plugin_unconfigured" if x_handle else "no_verified_handle")
                         ),
-                        "size_factor": float(soft.get("no_social_cut", 0.60)) if not x_handle else 1.0,
-                        "source": "onchain_metadata",
+                        "note": (
+                            grok_findings["SOCIAL"]["summary"]
+                            if "SOCIAL" in grok_findings
+                            else (
+                                f"On-chain X handle @{x_handle} verified; live X feed plugin not connected."
+                                if x_handle
+                                else "No verified on-chain X handle. Fan-account search is disabled."
+                            )
+                        ),
+                        "size_factor": float(eff_size_factor) if "SOCIAL" in grok_findings else (float(soft.get("no_social_cut", 0.60)) if not x_handle else 1.0),
+                        "decision_source": "grok_bot" if "SOCIAL" in grok_findings else decision_source,
+                        "source": "grok_bot" if "SOCIAL" in grok_findings else "onchain_metadata",
                     },
                 )
 
@@ -1184,9 +1470,31 @@ class Swarm:
                     allow_promoted=bool(config["strategy"].get("allow_promoted")),
                 )
 
-                # If JEV soft_kill rejected a token that deterministic rules would have proposed, record disagreement & hold.
                 det_outcome = decision.action
-                funnel_outcome = "kill" if (fk or tk or ck or sk) else decision.action
+                if grok_kill_reason:
+                    decision.action = "hold"
+                    decision.thesis = f"Grok Bot teammate veto ({grok_kill_reason}) withheld entry."
+                    decision.notional = None
+                elif grok_chief is not None:
+                    if grok_chief["action"] == "hold":
+                        decision.action = "hold"
+                        decision.thesis = f"[Grok Bot CHIEF] {grok_chief['thesis']}"
+                        decision.notional = None
+                    elif (
+                        grok_chief["action"] == "propose"
+                        and not (fk or tk or ck)
+                        and security.classification == "pass"
+                        and quote is not None
+                        and not quote.fail
+                        and (fee_bps is not None and fee_bps <= limits.max_fee_bps)
+                        and (not row.promoted or bool(config["strategy"].get("allow_promoted")))
+                    ):
+                        base_notional = min(q_usdc(limits.max_new_trade_usd), q_usdc(equity * limits.max_position_pct))
+                        decision.action = "propose"
+                        decision.thesis = f"[Grok Bot CHIEF] {grok_chief['thesis']}"
+                        decision.notional = q_usdc(base_notional * eff_size_factor)
+
+                funnel_outcome = "kill" if (fk or tk or ck or sk or grok_kill_reason) else decision.action
                 session.add(
                     ShadowDecision(
                         id=str(uuid.uuid4()),
@@ -1199,9 +1507,9 @@ class Swarm:
                         funnel_outcome=funnel_outcome,
                         deterministic_outcome=det_outcome,
                         disagreement=(funnel_outcome != det_outcome),
-                        jev_model=jev_model_used,
+                        jev_model=jev_model_used or ("grok_bot" if decision_source == "grok_bot" else "deterministic_fallback"),
                         jev_answers=jev_answers or None,
-                        reasons=[r for r in (fk, tk, ck, sk) if r] or (decision.evidence.get("failures") or []),
+                        reasons=[r for r in (fk, tk, ck, grok_kill_reason, sk) if r] or (decision.evidence.get("failures") or []),
                         paper_notional=decision.notional,
                     )
                 )
@@ -1219,10 +1527,12 @@ class Swarm:
                     max_exposure_pct=limits.max_exposure_pct,
                     max_trade_usd=limits.max_new_trade_usd,
                     pool_liquidity_usd=row.pool_liquidity_usd,
-                    size_factor=Decimal("1.0"),
+                    size_factor=eff_size_factor,
                     expected_fee_usd=quote.fee_usd if quote else Decimal("0.06"),
                     max_fee_bps=limits.max_fee_bps,
                 )
+                if decision.action == "propose" and size_info.viable and decision.notional is not None:
+                    decision.notional = min(decision.notional, size_info.ticket_usd)
 
                 proposal_id = str(uuid.uuid4())
                 pool_age = None
@@ -1238,7 +1548,12 @@ class Swarm:
                         requested_notional=decision.notional or Decimal("0"),
                         strategy_version=STRATEGY_VERSION,
                         thesis=decision.thesis,
-                        evidence={**decision.evidence, "jev_model": jev_model_used, "size_ticket": format(size_info.ticket_usd, "f")},
+                        evidence={
+                            **decision.evidence,
+                            "decision_source": decision_source,
+                            "jev_model": jev_model_used,
+                            "size_ticket": format(size_info.ticket_usd, "f"),
+                        },
                         expected_costs=decision.expected_costs,
                         exit_conditions=decision.exit_conditions,
                         created_at=now,
@@ -1267,264 +1582,316 @@ class Swarm:
                         "size_reason": size_info.reason,
                         "jev_connected": self.jev.available,
                         "jev_model": jev_model_used,
-                        "source": "jev+deterministic" if jev_model_used else "deterministic",
+                        "decision_source": decision_source,
+                        "source": decision_source,
                     },
                 )
+                risk_approved_val: bool | None = None
+                risk_reasons_val: list[str] = []
+                filled_order_id: str | None = None
+
                 if decision.action != "propose":
-                    self._touch(session, "strategy", row.symbol, "HOLD", now, now)
-                    continue
-
-                funnel_stats["picked"] = row.symbol
-                self._touch(session, "strategy", row.symbol, f"PICK {row.symbol}", now, now)
-                self._emit(
-                    session,
-                    source="strategy",
-                    event_type="size.ticket",
-                    correlation_id=correlation_id,
-                    mode=mode,
-                    mint=row.mint,
-                    now=now,
-                    payload={
-                        "seat": "SIZE",
-                        "phase": "size",
-                        "symbol": row.symbol,
-                        "ticket_usd": format(decision.notional or Decimal("0"), "f"),
-                        "pct_of_bank": format(size_info.pct_of_bank, "f"),
-                        "reason": size_info.reason,
-                    },
-                )
-
-                if shadow_mode:
+                    self._touch(session, "strategy", row.symbol, f"HOLD [{decision_source}]", now, now)
+                else:
+                    funnel_stats["picked"] = row.symbol
+                    self._touch(session, "strategy", row.symbol, f"PICK {row.symbol} [{decision_source}]", now, now)
                     self._emit(
                         session,
-                        source="orchestrator",
-                        event_type="shadow.logged_only",
+                        source="strategy",
+                        event_type="size.ticket",
                         correlation_id=correlation_id,
                         mode=mode,
                         mint=row.mint,
                         now=now,
                         payload={
-                            "seat": "CHIEF",
-                            "phase": "shadow",
+                            "seat": "SIZE",
+                            "phase": "size",
                             "symbol": row.symbol,
-                            "notional": format(decision.notional or Decimal("0"), "f"),
-                            "note": "Shadow mode active: candidate logged to shadow_decisions without creating a paper order.",
+                            "ticket_usd": format(decision.notional or Decimal("0"), "f"),
+                            "pct_of_bank": format(size_info.pct_of_bank, "f"),
+                            "reason": size_info.reason,
+                            "decision_source": decision_source,
                         },
                     )
-                    continue
 
-                open_same = (
-                    session.scalar(
-                        select(func.count())
-                        .select_from(Position)
-                        .where(Position.mode == mode, Position.mint == row.mint, Position.status.in_(("open", "unsellable")))
-                    )
-                    or 0
-                )
-                pending_same = (
-                    session.scalar(
-                        select(func.count())
-                        .select_from(PaperOrder)
-                        .where(
-                            PaperOrder.mode == mode,
-                            PaperOrder.mint == row.mint,
-                            PaperOrder.side == "buy",
-                            PaperOrder.status.in_(("pending", "partial")),
+                    if shadow_mode:
+                        self._emit(
+                            session,
+                            source="orchestrator",
+                            event_type="shadow.logged_only",
+                            correlation_id=correlation_id,
+                            mode=mode,
+                            mint=row.mint,
+                            now=now,
+                            payload={
+                                "seat": "CHIEF",
+                                "phase": "shadow",
+                                "symbol": row.symbol,
+                                "notional": format(decision.notional or Decimal("0"), "f"),
+                                "decision_source": decision_source,
+                                "note": "Shadow mode active: candidate logged to shadow_decisions without creating a paper order.",
+                            },
                         )
-                    )
-                    or 0
-                )
-                duplicate = int(open_same) > 0 or int(pending_same) > 0
-                last_order = session.scalar(
-                    select(PaperOrder)
-                    .where(PaperOrder.mode == mode, PaperOrder.mint == row.mint, PaperOrder.side == "buy")
-                    .order_by(desc(PaperOrder.created_at))
-                )
-                provider_ok = self.gecko.circuit.state != "open" and self.dex.circuit.state != "open" and self.gmgn.client.circuit.state != "open"
-                risk = evaluate_entry(
-                    now=now,
-                    limits=limits,
-                    portfolio=PortfolioView(
-                        mode=mode,
-                        cash=q_usdc(state.cash - state.reserved),
-                        equity=equity,
-                        peak_equity=state.peak_equity,
-                        day_start_equity=state.day_start_equity,
-                        open_positions=open_positions,
-                        open_exposure=exposure,
-                        emergency_stop=state.emergency_stop,
-                    ),
-                    proposal=ProposalView(
-                        proposal_id=proposal_id,
-                        mode=mode,
-                        mint=row.mint,
-                        side="buy",
-                        requested_notional=decision.notional or Decimal("0"),
-                        expires_at=now + timedelta(seconds=limits.quote_max_age_seconds),
-                        pool_liquidity_usd=row.pool_liquidity_usd,
-                        pool_age_minutes=pool_age,
-                        market_observed_at=row.observed_at,
-                    ),
-                    quote=quote,
-                    security=SecurityView(security.classification, now, security.critical_flags),
-                    provider_ok=provider_ok if mode == "live" else True,
-                    duplicate=duplicate,
-                    last_order_at=last_order.created_at if last_order else None,
-                )
-                risk_id = str(uuid.uuid4())
-                session.add(
-                    RiskDecision(
-                        id=risk_id,
-                        proposal_id=proposal_id,
-                        mode=mode,
-                        mint=row.mint,
-                        approved=risk.approved,
-                        reason_codes=risk.reason_codes,
-                        explanation=risk.explanation,
-                        limits_snapshot=limits.snapshot(),
-                        created_at=now,
-                        correlation_id=correlation_id,
-                    )
-                )
-                proposal = session.get(StrategyProposal, proposal_id)
-                if proposal:
-                    proposal.status = "approved" if risk.approved else "rejected"
-                self._emit(
-                    session,
-                    source="risk",
-                    event_type="risk.decision",
-                    correlation_id=correlation_id,
-                    mode=mode,
-                    mint=row.mint,
-                    now=now,
-                    payload={
-                        "seat": "RISK",
-                        "phase": "risk_gate",
-                        "symbol": row.symbol,
-                        "approved": risk.approved,
-                        "reason_codes": risk.reason_codes,
-                        "explanation": risk.explanation,
-                    },
-                )
-                self._touch(session, "risk", row.symbol, "approve" if risk.approved else "veto", now, now)
-                if not risk.approved or state.emergency_stop:
-                    continue
-                plan = plan_buy(
-                    cash=q_usdc(state.cash - state.reserved),
-                    requested=decision.notional or Decimal("0"),
-                    quote=quote,
-                    liquidity=row.pool_liquidity_usd,
-                    limits=limits,
-                    decimals=row.decimals,
-                )
-                order_id = str(uuid.uuid4())
-                order = PaperOrder(
-                    id=order_id,
-                    client_order_id=proposal_id,
-                    mode=mode,
-                    mint=row.mint,
-                    pool_address=row.pool_address,
-                    side="buy",
-                    requested_notional=decision.notional or Decimal("0"),
-                    status=plan.status,
-                    proposal_id=proposal_id,
-                    risk_decision_id=risk_id,
-                    quote={
-                        "price_usd": format(quote.price_usd, "f") if quote else None,
-                        "source": quote.source if quote else None,
-                        "fee_source": plan.fee_source,
-                        "venue": "gmgn_paper" if (quote and quote.source == "gmgn_quote") else "paper_sim",
-                    },
-                    filled_notional=plan.filled_notional,
-                    remaining_notional=plan.remaining_notional,
-                    rejection_reason=plan.reason,
-                    created_at=now,
-                    updated_at=now,
-                    correlation_id=correlation_id,
-                )
-                session.add(order)
-                session.flush()
-                if plan.fill is None:
-                    self._emit(
-                        session,
-                        source="execution",
-                        event_type="execution.reject",
-                        correlation_id=correlation_id,
-                        mode=mode,
-                        mint=row.mint,
-                        now=now,
-                        payload={"seat": "FILLS", "phase": "fills", "symbol": row.symbol, "status": plan.status, "reason": plan.reason},
-                    )
-                    continue
-                fill = plan.fill
-                state.cash = fill.cash_after
-                state.updated_at = now
-                position_id = str(uuid.uuid4())
-                session.add(
-                    Position(
-                        id=position_id,
-                        mode=mode,
-                        mint=row.mint,
-                        pool_address=row.pool_address,
-                        status="open",
-                        qty=fill.qty,
-                        avg_entry_price=fill.price,
-                        cost_basis=fill.spend,
-                        realized_pnl=Decimal("0"),
-                        fees=fill.fee,
-                        opened_at=now,
-                        strategy_version=STRATEGY_VERSION,
-                        exit_conditions=decision.exit_conditions,
-                        high_water_price=fill.price,
-                    )
-                )
-                order.position_id = position_id
-                session.add(
-                    PaperFill(
-                        id=str(uuid.uuid4()),
-                        order_id=order_id,
-                        mode=mode,
-                        qty=fill.qty,
-                        price=fill.price,
-                        notional=fill.notional,
-                        fee=fill.fee,
-                        fee_source=plan.fee_source,
-                        price_impact_bps=plan.price_impact_bps,
-                        filled_at=now,
-                    )
-                )
-                session.add(
-                    LedgerEntry(
-                        mode=mode,
-                        created_at=now,
-                        kind="buy",
-                        amount_usdc=-fill.spend,
-                        cash_after=state.cash,
-                        ref=order_id,
-                        memo=f"Paper buy {row.symbol} at quote ({plan.fee_source}).",
-                    )
-                )
-                self._emit(
-                    session,
-                    source="execution",
-                    event_type="execution.fill",
-                    correlation_id=correlation_id,
-                    mode=mode,
-                    mint=row.mint,
-                    now=now,
-                    payload={
-                        "seat": "FILLS",
-                        "phase": "fills",
-                        "symbol": row.symbol,
-                        "status": plan.status,
-                        "price": format(fill.price, "f"),
-                        "qty": format(fill.qty, "f"),
-                        "fee": format(fill.fee, "f"),
-                        "notional": format(fill.notional, "f"),
-                        "quote_source": quote.source if quote else None,
-                    },
-                )
-                self._touch(session, "execution", f"buy {row.symbol}", plan.status, now, now)
+                    else:
+                        open_same = (
+                            session.scalar(
+                                select(func.count())
+                                .select_from(Position)
+                                .where(Position.mode == mode, Position.mint == row.mint, Position.status.in_(("open", "unsellable")))
+                            )
+                            or 0
+                        )
+                        pending_same = (
+                            session.scalar(
+                                select(func.count())
+                                .select_from(PaperOrder)
+                                .where(
+                                    PaperOrder.mode == mode,
+                                    PaperOrder.mint == row.mint,
+                                    PaperOrder.side == "buy",
+                                    PaperOrder.status.in_(("pending", "partial")),
+                                )
+                            )
+                            or 0
+                        )
+                        duplicate = int(open_same) > 0 or int(pending_same) > 0
+                        last_order = session.scalar(
+                            select(PaperOrder)
+                            .where(PaperOrder.mode == mode, PaperOrder.mint == row.mint, PaperOrder.side == "buy")
+                            .order_by(desc(PaperOrder.created_at))
+                        )
+                        provider_ok = (
+                            self.gecko.circuit.state != "open"
+                            and self.dex.circuit.state != "open"
+                            and self.gmgn.client.circuit.state != "open"
+                        )
+                        risk = evaluate_entry(
+                            now=now,
+                            limits=limits,
+                            portfolio=PortfolioView(
+                                mode=mode,
+                                cash=q_usdc(state.cash - state.reserved),
+                                equity=equity,
+                                peak_equity=state.peak_equity,
+                                day_start_equity=state.day_start_equity,
+                                open_positions=open_positions,
+                                open_exposure=exposure,
+                                emergency_stop=state.emergency_stop,
+                            ),
+                            proposal=ProposalView(
+                                proposal_id=proposal_id,
+                                mode=mode,
+                                mint=row.mint,
+                                side="buy",
+                                requested_notional=decision.notional or Decimal("0"),
+                                expires_at=now + timedelta(seconds=limits.quote_max_age_seconds),
+                                pool_liquidity_usd=row.pool_liquidity_usd,
+                                pool_age_minutes=pool_age,
+                                market_observed_at=row.observed_at,
+                            ),
+                            quote=quote,
+                            security=SecurityView(security.classification, now, security.critical_flags),
+                            provider_ok=provider_ok if mode == "live" else True,
+                            duplicate=duplicate,
+                            last_order_at=last_order.created_at if last_order else None,
+                        )
+                        risk_approved_val = risk.approved
+                        risk_reasons_val = list(risk.reason_codes)
+                        risk_id = str(uuid.uuid4())
+                        session.add(
+                            RiskDecision(
+                                id=risk_id,
+                                proposal_id=proposal_id,
+                                mode=mode,
+                                mint=row.mint,
+                                approved=risk.approved,
+                                reason_codes=risk.reason_codes,
+                                explanation=risk.explanation,
+                                limits_snapshot=limits.snapshot(),
+                                created_at=now,
+                                correlation_id=correlation_id,
+                            )
+                        )
+                        proposal = session.get(StrategyProposal, proposal_id)
+                        if proposal:
+                            proposal.status = "approved" if risk.approved else "rejected"
+                        self._emit(
+                            session,
+                            source="risk",
+                            event_type="risk.decision",
+                            correlation_id=correlation_id,
+                            mode=mode,
+                            mint=row.mint,
+                            now=now,
+                            payload={
+                                "seat": "RISK",
+                                "phase": "risk_gate",
+                                "symbol": row.symbol,
+                                "approved": risk.approved,
+                                "reason_codes": risk.reason_codes,
+                                "explanation": risk.explanation,
+                                "decision_source": decision_source,
+                            },
+                        )
+                        self._touch(session, "risk", row.symbol, "approve" if risk.approved else "veto", now, now)
+                        if risk.approved and not state.emergency_stop:
+                            plan = plan_buy(
+                                cash=q_usdc(state.cash - state.reserved),
+                                requested=decision.notional or Decimal("0"),
+                                quote=quote,
+                                liquidity=row.pool_liquidity_usd,
+                                limits=limits,
+                                decimals=row.decimals,
+                            )
+                            order_id = str(uuid.uuid4())
+                            order = PaperOrder(
+                                id=order_id,
+                                client_order_id=proposal_id,
+                                mode=mode,
+                                mint=row.mint,
+                                pool_address=row.pool_address,
+                                side="buy",
+                                requested_notional=decision.notional or Decimal("0"),
+                                status=plan.status,
+                                proposal_id=proposal_id,
+                                risk_decision_id=risk_id,
+                                quote={
+                                    "price_usd": format(quote.price_usd, "f") if quote else None,
+                                    "source": quote.source if quote else None,
+                                    "fee_source": plan.fee_source,
+                                    "decision_source": decision_source,
+                                    "venue": (
+                                        "gmgn_paper"
+                                        if (quote and quote.source in {"gmgn_quote", "gmgn_amm_reserve_quote"})
+                                        else "paper_sim"
+                                    ),
+                                },
+                                filled_notional=plan.filled_notional,
+                                remaining_notional=plan.remaining_notional,
+                                rejection_reason=plan.reason,
+                                created_at=now,
+                                updated_at=now,
+                                correlation_id=correlation_id,
+                            )
+                            session.add(order)
+                            session.flush()
+                            if plan.fill is None:
+                                self._emit(
+                                    session,
+                                    source="execution",
+                                    event_type="execution.reject",
+                                    correlation_id=correlation_id,
+                                    mode=mode,
+                                    mint=row.mint,
+                                    now=now,
+                                    payload={
+                                        "seat": "FILLS",
+                                        "phase": "fills",
+                                        "symbol": row.symbol,
+                                        "status": plan.status,
+                                        "reason": plan.reason,
+                                        "decision_source": decision_source,
+                                    },
+                                )
+                            else:
+                                filled_order_id = order_id
+                                fill = plan.fill
+                                state.cash = fill.cash_after
+                                state.updated_at = now
+                                position_id = str(uuid.uuid4())
+                                session.add(
+                                    Position(
+                                        id=position_id,
+                                        mode=mode,
+                                        mint=row.mint,
+                                        pool_address=row.pool_address,
+                                        status="open",
+                                        qty=fill.qty,
+                                        avg_entry_price=fill.price,
+                                        cost_basis=fill.spend,
+                                        realized_pnl=Decimal("0"),
+                                        fees=fill.fee,
+                                        opened_at=now,
+                                        strategy_version=STRATEGY_VERSION,
+                                        exit_conditions=decision.exit_conditions,
+                                        high_water_price=fill.price,
+                                    )
+                                )
+                                order.position_id = position_id
+                                session.add(
+                                    PaperFill(
+                                        id=str(uuid.uuid4()),
+                                        order_id=order_id,
+                                        mode=mode,
+                                        qty=fill.qty,
+                                        price=fill.price,
+                                        notional=fill.notional,
+                                        fee=fill.fee,
+                                        fee_source=plan.fee_source,
+                                        price_impact_bps=plan.price_impact_bps,
+                                        filled_at=now,
+                                    )
+                                )
+                                session.add(
+                                    LedgerEntry(
+                                        mode=mode,
+                                        created_at=now,
+                                        kind="buy",
+                                        amount_usdc=-fill.spend,
+                                        cash_after=state.cash,
+                                        ref=order_id,
+                                        memo=f"Paper buy {row.symbol} at quote ({plan.fee_source}) [{decision_source}].",
+                                    )
+                                )
+                                self._emit(
+                                    session,
+                                    source="execution",
+                                    event_type="execution.fill",
+                                    correlation_id=correlation_id,
+                                    mode=mode,
+                                    mint=row.mint,
+                                    now=now,
+                                    payload={
+                                        "seat": "FILLS",
+                                        "phase": "fills",
+                                        "symbol": row.symbol,
+                                        "status": plan.status,
+                                        "price": format(fill.price, "f"),
+                                        "qty": format(fill.qty, "f"),
+                                        "fee": format(fill.fee, "f"),
+                                        "notional": format(fill.notional, "f"),
+                                        "quote_source": quote.source if quote else None,
+                                        "decision_source": decision_source,
+                                    },
+                                )
+                                self._touch(session, "execution", f"buy {row.symbol} [{decision_source}]", plan.status, now, now)
+
+            await self.coord.record_decision(
+                cycle_id=cycle_id,
+                mode=mode,
+                mint=row.mint,
+                symbol=row.symbol,
+                action="veto" if (decision.action == "propose" and risk_approved_val is False) else decision.action,
+                decision_source=decision_source,
+                confidence=(
+                    Decimal(str(grok_chief["confidence"]))
+                    if (grok_chief and grok_chief.get("confidence") is not None)
+                    else Decimal(str(round(momentum.confidence, 4)))
+                ),
+                size_factor=eff_size_factor,
+                thesis=decision.thesis,
+                reasons=[r for r in (fk, tk, ck, grok_kill_reason, sk) if r] or (decision.evidence.get("failures") or []),
+                risk_approved=risk_approved_val,
+                risk_reason_codes=risk_reasons_val,
+                paper_order_id=filled_order_id,
+                decision_payload={
+                    "proposal_id": proposal_id,
+                    "notional_usd": format(decision.notional, "f") if decision.notional is not None else None,
+                    "quote_source": quote.source if quote else None,
+                },
+                decision_id=grok_chief["id"] if grok_chief else None,
+                now=now,
+            )
 
         # If 2+ live JEV survivors exist, execute the single `pick` call and log it transparently.
         if len(jev_survivors) >= 2 and self.jev.available:
@@ -1565,7 +1932,9 @@ class Swarm:
 
         await self._monitor_exits(now, mode, limits)
         with session_scope() as session:
-            state, equity, exposure, _count, fresh = self._books(session, mode, now, limits)
+            state, equity, exposure, open_cnt, fresh = self._books(session, mode, now, limits)
+            cash_val = state.cash
+            estop_val = state.emergency_stop
             peak = state.peak_equity
             drawdown = (peak - equity) / peak if peak else Decimal("0")
             session.add(
@@ -1624,7 +1993,75 @@ class Swarm:
                     payload={"available": False, "source": "unavailable", "note": "Deterministic agent text is not Grok output."},
                 )
             self._touch(session, "orchestrator", "cycle", "complete", now, now)
-        return {"mode": mode, "candidates": len(scored), "cycle_id": cycle_id}
+
+        # Record deterministic engine heartbeats + compact dashboard snapshot + retention pruning.
+        top_sym = scored[0].symbol if scored else None
+        top_mint = scored[0].mint if scored else None
+        for det_seat in ("SIZE", "FILLS", "RISK"):
+            await self.coord.record_heartbeat(
+                seat=det_seat,
+                status="paused" if (det_seat == "RISK" and estop_val) else "online",
+                decision_source="deterministic_engine",
+                mode=mode,
+                active_mint=top_mint,
+                active_symbol=top_sym,
+                agent_id=f"local-{det_seat.lower()}",
+                note="independent deterministic engine",
+                now=now,
+            )
+        if cycle_primary_source == "deterministic_fallback":
+            fresh_cutoff = now - timedelta(seconds=max(15, self.settings.grok_bot_freshness_seconds))
+            with session_scope() as session:
+                from app.models import SwarmAgentHeartbeat
+
+                fresh_grok_seats = {
+                    r.seat
+                    for r in session.scalars(
+                        select(SwarmAgentHeartbeat).where(
+                            SwarmAgentHeartbeat.decision_source == "grok_bot",
+                            SwarmAgentHeartbeat.last_seen_at >= fresh_cutoff,
+                        )
+                    ).all()
+                }
+            for fb_seat in ("CHIEF", "SCAN", "VET", "SOCIAL"):
+                if fb_seat not in fresh_grok_seats:
+                    await self.coord.record_heartbeat(
+                        seat=fb_seat,
+                        status="fallback",
+                        decision_source="deterministic_fallback",
+                        mode=mode,
+                        active_mint=top_mint,
+                        active_symbol=top_sym,
+                        agent_id=f"local-fallback-{fb_seat.lower()}",
+                        note="Grok Bot teammate offline/stale; free local deterministic fallback active",
+                        now=now,
+                    )
+
+        await self.coord.sync_dashboard_snapshot(
+            mode=mode,
+            emergency_stop=bool(estop_val),
+            equity_usdc=format(equity, "f"),
+            cash_usdc=format(cash_val, "f"),
+            open_positions=open_cnt,
+            held_symbol=funnel_stats.get("picked") or top_sym,
+            decision_source=cycle_primary_source,
+            snapshot={
+                "cycle_id": cycle_id,
+                "seen": funnel_stats.get("seen", 0),
+                "evaluated": funnel_stats.get("evaluated", 0),
+                "picked": funnel_stats.get("picked"),
+                "benched": funnel_stats.get("benched", 0),
+                "rugs_killed": funnel_stats.get("rugs_killed", 0),
+            },
+            now=now,
+        )
+        await self.coord.prune_expired(now=now)
+        return {
+            "mode": mode,
+            "candidates": len(scored),
+            "cycle_id": cycle_id,
+            "decision_source": cycle_primary_source,
+        }
 
     async def _monitor_exits(self, now: datetime, mode: str, limits: RiskLimits) -> None:
         with session_scope() as session:
@@ -1657,7 +2094,17 @@ class Swarm:
             if mode == "demo" and market is not None:
                 quote = demo_quote(now, mint, "sell", market, cost)
             elif mode == "live":
-                quote = await self._quote(mode, mint, "sell", market, cost, 6, now)
+                quote = await self._quote(
+                    mode,
+                    mint,
+                    "sell",
+                    market,
+                    cost,
+                    6,
+                    now,
+                    pool_liquidity_usd=obs.pool_liquidity_usd if obs else None,
+                    can_sell_ok=not security_failed,
+                )
             signal = exit_reason(
                 entry_price=entry,
                 market_price=market,
