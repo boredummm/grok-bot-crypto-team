@@ -1,18 +1,25 @@
 # API
 
-Authentication is `Authorization: Bearer <token>`.
+Authentication uses `Authorization: Bearer <token>` (or `?token=<token>` on WebSocket `/ws` and SSE `/api/events/stream`).
 
-- `SOLSWARM_MONITOR_TOKEN` reads dashboard and `/api/monitor/*` routes.
-- `SOLSWARM_ADMIN_TOKEN` can also pause entries, resume entries, change mode, change settings, and start a replay.
+- `SOLSWARM_MONITOR_TOKEN`: Read-only access to dashboard queries, `/api/desk`, `/api/events/stream`, and `/api/monitor/*`.
+- `SOLSWARM_ADMIN_TOKEN`: Required for `POST /api/control/emergency-stop`, `POST /api/control/resume`, `POST /api/control/mode`, `POST /api/control/cycle`, `PUT /api/settings`, `PUT /api/thresholds`, and `POST /api/backtests`.
 
-`GET /api/health` is public and reports only that the process is up and that live execution is disabled.
+`GET /api/health` is public and confirms `paper_trading: true` and `live_execution_enabled: false`.
 
-Monitor routes: `/api/monitor/summary`, `portfolio`, `positions`, `orders`, `agents`, `alerts`, `providers`, `tailscale`, `decisions`.
+## Control Room & Funnel Endpoints
 
-There is no monitor route that changes risk limits or submits an order. External agents, including Claude and Grok Bot, should use the monitor token. Responses do not include API keys.
+- `GET /api/desk` — Complete 8-seat state (`CHIEF`, `SCAN`, `VET`, `SOCIAL`, `SIZE`, `FILLS`, `RISK`, `CRAWLER`), active token candlesticks & security checklist, crawler web edges, real paper balance curve, `JEV · ANALYSIS` audit log, and `thresholds.py` snapshot.
+- `GET /api/desk/seats/{seat}` — Click-to-inspect dossier for any seat: logical engine, heartbeat age, duration, JEV/GMGN provenance, threshold snapshot, recent `RiskEngine` vetoes, and seat event timeline.
+- `GET /api/desk/demo-playback` — Explicitly labeled `DEMO PLAYBACK` deterministic 7-step storyboard (never modifies portfolio state).
+- `GET /api/bench` — Rejection bench entries with reason-specific TTLs.
+- `GET /api/shadow` — Shadow comparison rows and disagreement counts.
+- `GET /api/thresholds` / `PUT /api/thresholds` — Active `HARD` and `SOFT` gates, `filter.py` stage counters, `shadow_mode`, `one_position_at_a_time`, and `use_bench` toggles.
+- `GET /api/events/stream` — Authenticated Server-Sent Events stream for real-time Control Room updates.
 
-WebSocket: `/ws?token=<monitor-or-admin-token>`.
+## External Agent Monitor Surface (`/api/monitor/*`)
 
-Settings writes reject values outside the paper-trading ranges and reject fields that would enable leverage or live execution. There is no live-trading switch.
+Read-only routes for Claude, Grok Bot, and external monitors:
+`/api/monitor/summary`, `/api/monitor/desk`, `/api/monitor/bench`, `/api/monitor/shadow`, `/api/monitor/thresholds`, `/api/monitor/portfolio`, `/api/monitor/positions`, `/api/monitor/orders`, `/api/monitor/agents`, `/api/monitor/alerts`, `/api/monitor/providers`, `/api/monitor/tailscale`, `/api/monitor/decisions`.
 
-Replay `POST /api/backtests` stores a result document and does not insert paper orders.
+No control or live-execution endpoint exists under `/api/monitor/*`.

@@ -1,4 +1,4 @@
-"""Orchestrator. Discovery never reaches an order without the risk engine."""
+"""Orchestrator + 8-seat GMGN/JEV funnel. Discovery never reaches an order without the risk engine."""
 
 from __future__ import annotations
 
@@ -28,14 +28,26 @@ from app.config import Settings
 from app.db import session_scope, utcnow
 from app.demo import demo_exit_routes, demo_facts, demo_observations, demo_quote
 from app.execution import plan_buy, plan_sell
+from app.funnel import (
+    DEFAULT_THRESHOLDS,
+    bench_ttl_minutes,
+    chain_kill,
+    compute_size_ticket,
+    free_kill,
+    soft_kill,
+    trade_kill,
+)
 from app.grok_client import GrokClient
+from app.jev import JevClient
 from app.models import (
     AgentEvent,
     AgentHealth,
     Alert,
     AppSetting,
+    BenchEntry,
     ConfigVersion,
     EquitySnapshot,
+    FunnelRun,
     LedgerEntry,
     LiquidityPool,
     MarketObservation,
@@ -46,10 +58,12 @@ from app.models import (
     ProviderHealth,
     RiskDecision,
     SecurityAssessment,
+    ShadowDecision,
     StrategyProposal,
     Token,
 )
-from app.money import q_usdc
+from app.money import USDC_MINT, q_usdc
+from app.providers.gmgn import GmgnAdapter, GmgnDossier, clean_x_handle, compare_provider_evidence
 from app.providers.http import ProviderClient, ProviderError, ProviderSnapshot
 from app.providers.jupiter import JupiterAdapter
 from app.providers.normalize import parse_boosted_mints, parse_dexscreener_pairs, parse_geckoterminal_pools
@@ -71,7 +85,14 @@ AGENTS = (
 
 DEFAULT_CONFIG = {
     "mode": "demo",
-    "scanner": {"interval_seconds": 60, "max_candidates": 8, "min_discovery_score": 35},
+    "scanner": {
+        "interval_seconds": 60,
+        "max_candidates": 8,
+        "min_discovery_score": 35,
+        "one_position_at_a_time": False,
+        "shadow_mode": False,
+        "use_bench": False,
+    },
     "strategy": {
         "version": STRATEGY_VERSION,
         "momentum_threshold": 65,
@@ -95,6 +116,10 @@ DEFAULT_CONFIG = {
         "security_max_age_seconds": 300,
         "cooldown_seconds": 600,
         "max_pool_participation": "0.01",
+    },
+    "thresholds": {
+        "hard": dict(DEFAULT_THRESHOLDS["hard"]),
+        "soft": dict(DEFAULT_THRESHOLDS["soft"]),
     },
     "simulation": {"network_fee_usdc": "0.02", "network_fee_source": "assumed"},
     "ai": {"hourly_budget": 20},
@@ -130,19 +155,32 @@ class Swarm:
         *,
         gecko: ProviderClient | None = None,
         dex: ProviderClient | None = None,
+        gmgn: GmgnAdapter | None = None,
         jupiter: JupiterAdapter | None = None,
         rpc: SolanaRpc | None = None,
+        jev: JevClient | None = None,
         grok: GrokClient | None = None,
     ) -> None:
         self.settings = settings
         self.gecko = gecko or ProviderClient("geckoterminal", per_minute=8)
         self.dex = dex or ProviderClient("dexscreener", per_minute=60)
+        self.gmgn = gmgn or GmgnAdapter(
+            ProviderClient("gmgn", per_minute=20),
+            settings.gmgn_api_key,
+            settings.gmgn_base_url,
+        )
         self.jupiter = jupiter or JupiterAdapter(
             ProviderClient("jupiter", per_minute=30),
             settings.jupiter_api_key,
             settings.jupiter_base,
         )
         self.rpc = rpc or SolanaRpc(ProviderClient("solana_rpc", per_minute=20), settings.solana_rpc_url)
+        self.jev = jev or JevClient(
+            ProviderClient("jev", per_minute=30),
+            settings.typesafe_api_key,
+            settings.typesafe_model,
+            settings.typesafe_base_url,
+        )
         self.grok = grok or GrokClient(
             ProviderClient("grok", per_minute=20),
             settings.xai_api_key,
@@ -156,8 +194,10 @@ class Swarm:
     async def aclose(self) -> None:
         await self.gecko.aclose()
         await self.dex.aclose()
+        await self.gmgn.client.aclose()
         await self.jupiter.client.aclose()
         await self.rpc.client.aclose()
+        await self.jev.client.aclose()
         await self.grok.client.aclose()
 
     def bootstrap(self) -> None:
@@ -169,7 +209,10 @@ class Swarm:
 
             if session.get(SchemaMigration, 1) is None:
                 session.add(SchemaMigration(version=1, applied_at=utcnow()))
-            if session.get(AppSetting, "runtime") is None:
+            if session.get(SchemaMigration, 2) is None:
+                session.add(SchemaMigration(version=2, applied_at=utcnow()))
+            runtime = session.get(AppSetting, "runtime")
+            if runtime is None:
                 config = dict(DEFAULT_CONFIG)
                 config["mode"] = self.settings.mode
                 config["ai"]["hourly_budget"] = self.settings.ai_hourly_budget
@@ -177,6 +220,20 @@ class Swarm:
                 session.add(
                     ConfigVersion(created_at=utcnow(), actor="system", document=config, note="initial configuration")
                 )
+            else:
+                merged = dict(DEFAULT_CONFIG)
+                for key, val in (runtime.value or {}).items():
+                    if isinstance(val, dict) and isinstance(merged.get(key), dict):
+                        merged[key] = {**merged[key], **val}
+                    else:
+                        merged[key] = val
+                if "thresholds" not in merged:
+                    merged["thresholds"] = {
+                        "hard": dict(DEFAULT_THRESHOLDS["hard"]),
+                        "soft": dict(DEFAULT_THRESHOLDS["soft"]),
+                    }
+                runtime.value = merged
+                runtime.updated_at = utcnow()
             for name in AGENTS:
                 if session.get(AgentHealth, name) is None:
                     session.add(
@@ -204,6 +261,18 @@ class Swarm:
     def _config(self, session) -> dict:
         row = session.get(AppSetting, "runtime")
         return row.value if row else dict(DEFAULT_CONFIG)
+
+    def _thresholds(self, config: dict) -> tuple[dict, dict]:
+        th = config.get("thresholds") or {}
+        hard = {**DEFAULT_THRESHOLDS["hard"], **(th.get("hard") or {})}
+        # Keep min_liquidity_usd synced with risk.min_pool_liquidity_usd when risk overrides it.
+        risk_cfg = config.get("risk") or {}
+        if "min_pool_liquidity_usd" in risk_cfg:
+            hard["min_liquidity_usd"] = float(risk_cfg["min_pool_liquidity_usd"])
+        if "min_pool_age_minutes" in risk_cfg:
+            hard["min_age_minutes"] = int(risk_cfg["min_pool_age_minutes"])
+        soft = {**DEFAULT_THRESHOLDS["soft"], **(th.get("soft") or {})}
+        return hard, soft
 
     def _ensure_state(self, session, mode: str, now: datetime) -> PortfolioState:
         state = session.get(PortfolioState, mode)
@@ -246,6 +315,50 @@ class Swarm:
                     state.reserved = Decimal("0")
                     state.updated_at = utcnow()
 
+    def _is_benched(self, session, mode: str, mint: str, now: datetime) -> BenchEntry | None:
+        row = session.scalar(select(BenchEntry).where(BenchEntry.mode == mode, BenchEntry.mint == mint))
+        if row is not None and row.until_at > now:
+            return row
+        return None
+
+    def _sit_bench(
+        self,
+        session,
+        *,
+        mode: str,
+        mint: str,
+        symbol: str,
+        reason: str,
+        stage: str,
+        now: datetime,
+        details: dict | None = None,
+    ) -> BenchEntry:
+        ttl = bench_ttl_minutes(reason)
+        until = now + timedelta(minutes=ttl)
+        existing = session.scalar(select(BenchEntry).where(BenchEntry.mode == mode, BenchEntry.mint == mint))
+        if existing is None:
+            existing = BenchEntry(
+                mode=mode,
+                mint=mint,
+                symbol=symbol[:32],
+                reason=reason[:64],
+                stage=stage[:32],
+                ttl_minutes=ttl,
+                benched_at=now,
+                until_at=until,
+                details=details,
+            )
+            session.add(existing)
+        else:
+            existing.symbol = symbol[:32]
+            existing.reason = reason[:64]
+            existing.stage = stage[:32]
+            existing.ttl_minutes = ttl
+            existing.benched_at = now
+            existing.until_at = until
+            existing.details = details
+        return existing
+
     def _emit(
         self,
         session,
@@ -279,13 +392,22 @@ class Swarm:
         )
         return True
 
-    def _touch(self, session, agent: str, task: str, decision: str, started: datetime, now: datetime, error: str | None = None) -> None:
+    def _touch(
+        self,
+        session,
+        agent: str,
+        task: str,
+        decision: str,
+        started: datetime,
+        now: datetime,
+        error: str | None = None,
+    ) -> None:
         row = session.get(AgentHealth, agent)
         if row is None:
             return
         row.status = "error" if error else "ok"
         row.last_heartbeat = now
-        row.last_task = task
+        row.last_task = task[:160]
         row.last_duration_ms = int((now - started).total_seconds() * 1000)
         row.processed_count += 0 if error else 1
         row.last_decision = decision[:500]
@@ -308,7 +430,7 @@ class Swarm:
         if snap.status == "ok":
             row.last_ok_at = utcnow()
 
-    def _persist_observation(self, session, row: Observation, score: int) -> None:
+    def _persist_observation(self, session, row: Observation, score: int, provenance_extra: dict | None = None) -> None:
         token = session.scalar(select(Token).where(Token.mode == row.mode, Token.mint == row.mint))
         if token is None:
             session.add(
@@ -345,6 +467,9 @@ class Swarm:
                     first_seen_at=row.observed_at,
                 )
             )
+        prov = {"provider": row.provider, "promoted_listing": row.promoted}
+        if provenance_extra:
+            prov.update(provenance_extra)
         session.add(
             MarketObservation(
                 mode=row.mode,
@@ -369,16 +494,16 @@ class Swarm:
                 unique_buyers_m5=row.unique_buyers_m5,
                 discovery_score=score,
                 promoted=row.promoted,
-                provenance={"provider": row.provider, "promoted_listing": row.promoted},
+                provenance=prov,
             )
         )
 
     def _seed_demo_chart(self, session, now: datetime) -> None:
         """Prior demo prints so the chart is not a single dot. Labeled as fixtures."""
-        from app.models import MarketObservation
-
         existing = session.scalar(
-            select(func.count()).select_from(MarketObservation).where(MarketObservation.mode == "demo", MarketObservation.mint == "demo:momentum")
+            select(func.count())
+            .select_from(MarketObservation)
+            .where(MarketObservation.mode == "demo", MarketObservation.mint == "demo:momentum")
         )
         if int(existing or 0) > 4:
             return
@@ -453,6 +578,11 @@ class Swarm:
 
     async def discover_live(self, now: datetime) -> list[Observation]:
         rows: list[Observation] = []
+        if self.gmgn.configured:
+            try:
+                rows.extend(await self.gmgn.trending_sol(observed_at=now, mode="live", interval="5m", limit=20))
+            except ProviderError as exc:
+                log.warning("gmgn trending unavailable: %s", exc.message)
         headers = {"Accept": "application/json;version=20230203"}
         try:
             payload = await self.gecko.get_json(
@@ -494,44 +624,103 @@ class Swarm:
                 row.promoted = True
         return rows
 
-    async def _quote(self, mode: str, mint: str, side: str, price: Decimal | None, notional: Decimal, decimals: int, now: datetime) -> QuoteView | None:
+    async def _quote(
+        self,
+        mode: str,
+        mint: str,
+        side: str,
+        price: Decimal | None,
+        notional: Decimal,
+        decimals: int,
+        now: datetime,
+    ) -> QuoteView | None:
         if mode == "demo":
             if price is None:
                 return None
             return demo_quote(now, mint, side, price, notional)
-        if not self.jupiter.client.configured:
-            return None
+        # Prefer GMGN paper quote when GMGN_API_KEY is configured, fallback to Jupiter Swap v2 quote.
         if side == "buy":
             amount = int((notional * Decimal("1000000")).to_integral_value())
-            return await self.jupiter.order_quote(
-                input_mint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                output_mint=mint,
-                amount_base_units=amount,
-                side="buy",
-                observed_at=now,
-                decimals_out=decimals,
-            )
-        amount = int((notional * (Decimal(10) ** decimals) / (price or Decimal("1"))).to_integral_value())
-        if amount <= 0:
-            amount = 1
+            input_mint, output_mint = USDC_MINT, mint
+        else:
+            amount = int((notional * (Decimal(10) ** decimals) / (price or Decimal("1"))).to_integral_value())
+            if amount <= 0:
+                amount = 1
+            input_mint, output_mint = mint, USDC_MINT
+
+        if self.gmgn.configured:
+            try:
+                gmgn_q = await self.gmgn.paper_quote(
+                    input_mint=input_mint,
+                    output_mint=output_mint,
+                    amount_base_units=amount,
+                    side=side,
+                    observed_at=now,
+                    decimals_out=decimals,
+                )
+                if gmgn_q is not None:
+                    return gmgn_q
+            except ProviderError as exc:
+                log.warning("gmgn paper quote unavailable: %s", exc.message)
+
+        if not self.jupiter.client.configured:
+            return None
         return await self.jupiter.order_quote(
-            input_mint=mint,
-            output_mint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            input_mint=input_mint,
+            output_mint=output_mint,
             amount_base_units=amount,
-            side="sell",
+            side=side,
             observed_at=now,
             decimals_out=decimals,
         )
 
-    async def _facts(self, mode: str, mint: str, now: datetime, provided: dict[str, AuthorityFacts] | None) -> AuthorityFacts | None:
+    async def _facts_and_dossier(
+        self,
+        mode: str,
+        row: Observation,
+        now: datetime,
+        provided: dict[str, AuthorityFacts] | None,
+    ) -> tuple[AuthorityFacts | None, GmgnDossier | None, str | None]:
         if mode == "demo":
-            return (provided or demo_facts(now)).get(mint)
+            demo_map = provided or demo_facts(now)
+            handle = "demomom_sol" if row.mint == "demo:momentum" else None
+            return demo_map.get(row.mint), None, handle
+
+        dossier: GmgnDossier | None = None
+        x_handle: str | None = None
+        if self.gmgn.configured:
+            try:
+                dossier = await self.gmgn.token_dossier(row.mint, mode=mode, observed_at=now)
+                x_handle = dossier.x_handle
+            except ProviderError as exc:
+                log.warning("gmgn dossier unavailable for %s: %s", row.mint, exc.message)
+
+        if x_handle is None and mode == "live":
+            # Try GeckoTerminal token info for verified on-chain twitter_handle if available.
+            try:
+                gt_info = await self.gecko.get_json(
+                    f"{self.settings.gecko_base}/networks/solana/tokens/{row.mint}/info",
+                    headers={"Accept": "application/json;version=20230203"},
+                )
+                attr = ((gt_info or {}).get("data") or {}).get("attributes") or {}
+                x_handle = clean_x_handle(attr.get("twitter_handle"))
+            except ProviderError:
+                pass
+
         try:
-            inspection = await self.rpc.inspect_mint(mint, now)
-            return inspection.facts
+            inspection = await self.rpc.inspect_mint(row.mint, now)
+            rpc_facts = inspection.facts
+            if dossier and dossier.facts:
+                if rpc_facts.top_holder_pct is None and dossier.top_10_percent is not None:
+                    rpc_facts.top_holder_pct = dossier.top_10_percent
+                if dossier.facts.malicious_flag is True:
+                    rpc_facts.malicious_flag = True
+            return rpc_facts, dossier, x_handle
         except Exception as exc:
             log.warning("solana rpc mint inspection unavailable: %s", exc)
-            return None
+            if dossier and dossier.facts:
+                return dossier.facts, dossier, x_handle
+            return None, dossier, x_handle
 
     def _books(self, session, mode: str, now: datetime, limits: RiskLimits) -> tuple[PortfolioState, Decimal, Decimal, int, bool]:
         state = self._ensure_state(session, mode, now)
@@ -568,35 +757,139 @@ class Swarm:
         exit_routes: dict[str, bool | None] | None = None,
     ) -> dict:
         now = now or utcnow()
+        cycle_id = str(uuid.uuid4())
         with session_scope() as session:
             mode = self._mode(session)
             config = self._config(session)
             limits = limits_from_config(config)
+            hard, soft = self._thresholds(config)
+            scanner_cfg = config.get("scanner") or {}
+            one_at_a_time = bool(scanner_cfg.get("one_position_at_a_time", False))
+            shadow_mode = bool(scanner_cfg.get("shadow_mode", False))
+            use_bench = bool(scanner_cfg.get("use_bench", False))
             started = now
             self._touch(session, "orchestrator", "cycle", "started", started, now)
+            held_pos = session.scalar(
+                select(Position).where(Position.mode == mode, Position.status.in_(("open", "unsellable"))).order_by(desc(Position.opened_at))
+            )
+            held_symbol = None
+            if held_pos:
+                tok = session.scalar(select(Token).where(Token.mode == mode, Token.mint == held_pos.mint))
+                held_symbol = tok.symbol if tok else held_pos.mint
+
+        # Optional strict guide rule: when `one_position_at_a_time` is enabled and a position is held,
+        # skip scanning and run RISK exit monitoring only.
+        if one_at_a_time and held_symbol and observations is None:
+            await self._monitor_exits(now, mode, limits)
+            with session_scope() as session:
+                self._emit(
+                    session,
+                    source="orchestrator",
+                    event_type="desk.held_skip_scan",
+                    correlation_id=cycle_id,
+                    mode=mode,
+                    mint=None,
+                    now=now,
+                    payload={"seat": "RISK", "phase": "held", "symbol": held_symbol, "reason": "one_position_at_a_time"},
+                )
+                session.add(
+                    FunnelRun(
+                        id=cycle_id,
+                        mode=mode,
+                        created_at=now,
+                        held_symbol=held_symbol,
+                        shadow_mode=shadow_mode,
+                        jev_connected=self.jev.available,
+                        jev_model=self.jev.last_resolved_model,
+                        gmgn_configured=self.gmgn.configured,
+                        stats={"seen": 0, "benched": 0, "held": held_symbol, "free": {}, "trade": {}, "chain": {}, "soft": {}, "picked": None},
+                        thresholds_snapshot={"hard": hard, "soft": soft},
+                    )
+                )
+            return {"mode": mode, "candidates": 0, "held": held_symbol}
+
         if observations is None:
             if mode == "demo":
                 observations = demo_observations(now)
             else:
                 observations = await self.discover_live(now)
         raw_rows = list(observations)
+        by_mint_provider: dict[tuple[str, str], Observation] = {(r.mint, r.provider): r for r in raw_rows}
         candidates = dedupe_by_mint(raw_rows)
         max_candidates = int((config.get("scanner") or {}).get("max_candidates", 8))
         scored = sorted(candidates, key=lambda row: discovery_score(row, now), reverse=True)[:max_candidates]
+
+        funnel_stats: dict = {
+            "seen": len(candidates),
+            "evaluated": len(scored),
+            "benched": 0,
+            "free": {},
+            "trade": {},
+            "chain": {},
+            "soft": {},
+            "picked": None,
+            "pages_read": len(raw_rows),
+            "rugs_killed": 0,
+            "webs_spun": 0,
+        }
+
         with session_scope() as session:
             for row in raw_rows:
-                self._persist_observation(session, row, discovery_score(row, now))
+                gmgn_obs = by_mint_provider.get((row.mint, "gmgn"))
+                sec_obs = by_mint_provider.get((row.mint, "dexscreener")) or by_mint_provider.get((row.mint, "geckoterminal"))
+                cmp_extra = None
+                if gmgn_obs and sec_obs and row.provider == "gmgn":
+                    cmp = compare_provider_evidence(gmgn_obs, sec_obs, now=now, max_age_seconds=limits.market_max_age_seconds)
+                    cmp_extra = {"comparison": cmp.__dict__}
+                self._persist_observation(session, row, discovery_score(row, now), provenance_extra=cmp_extra)
                 session.flush()
             if mode == "demo":
                 self._seed_demo_chart(session, now)
+            self._emit(
+                session,
+                source="discovery",
+                event_type="crawler.sweep",
+                correlation_id=cycle_id,
+                mode=mode,
+                mint=scored[0].mint if scored else None,
+                now=now,
+                payload={
+                    "seat": "CRAWLER",
+                    "phase": "crawl",
+                    "raw_pools": len(raw_rows),
+                    "deduped": len(candidates),
+                    "gmgn_active": bool(self.gmgn.configured and mode == "live"),
+                    "source": "demo_fixture" if mode == "demo" else ("gmgn+geckoterminal+dexscreener" if self.gmgn.configured else "geckoterminal+dexscreener"),
+                },
+            )
 
         quotes_by_mint: dict[str, QuoteView | None] = {}
-        reports: dict[str, tuple[MomentumReport, SecurityReport, QuoteView | None]] = {}
+        jev_survivors: list[tuple[Observation, dict, str]] = []
+
         for row in scored:
             correlation_id = str(uuid.uuid4())
             score = discovery_score(row, now)
-            previous = None
             with session_scope() as session:
+                benched = self._is_benched(session, mode, row.mint, now) if use_bench else None
+                if benched is not None:
+                    funnel_stats["benched"] += 1
+                    self._emit(
+                        session,
+                        source="discovery",
+                        event_type="funnel.benched_skip",
+                        correlation_id=correlation_id,
+                        mode=mode,
+                        mint=row.mint,
+                        now=now,
+                        payload={
+                            "seat": "SCAN",
+                            "phase": "bench",
+                            "symbol": row.symbol,
+                            "reason": benched.reason,
+                            "until": benched.until_at.isoformat(),
+                        },
+                    )
+                    continue
                 previous = self._previous_observation(session, row.mode if row.mode else mode, row.mint, row.observed_at)
                 self._emit(
                     session,
@@ -607,6 +900,8 @@ class Swarm:
                     mint=row.mint,
                     now=now,
                     payload={
+                        "seat": "SCAN",
+                        "phase": "universe",
                         "symbol": row.symbol,
                         "score": score,
                         "pools": row.pools,
@@ -616,6 +911,14 @@ class Swarm:
                     },
                 )
                 self._touch(session, "discovery", f"scan {row.symbol}", f"score {score}", now, now)
+
+            # Record deterministic funnel stage classifications (`free_kill`, `trade_kill`) for `thresholds.py` telemetry.
+            fk = free_kill(row, now, hard)
+            tk = None if fk else trade_kill(row, hard)
+            if fk:
+                funnel_stats["free"][fk] = funnel_stats["free"].get(fk, 0) + 1
+            elif tk:
+                funnel_stats["trade"][tk] = funnel_stats["trade"].get(tk, 0) + 1
 
             async def _momentum():
                 if self.momentum_delay:
@@ -638,8 +941,9 @@ class Swarm:
                     quote = await self._quote(mode, row.mint, "buy", row.price_usd, Decimal("20"), row.decimals, now)
                     sell = await self._quote(mode, row.mint, "sell", row.price_usd, Decimal("1"), row.decimals, now)
                     quotes_by_mint[row.mint] = quote
-                    exit_ok = bool(sell and not sell.fail) if sell is not None else (False if self.jupiter.client.configured else None)
-                authority = await self._facts(mode, row.mint, now, facts)
+                    has_quote_provider = self.gmgn.configured or self.jupiter.client.configured
+                    exit_ok = bool(sell and not sell.fail) if sell is not None else (False if has_quote_provider else None)
+                authority, dossier, x_handle = await self._facts_and_dossier(mode, row, now, facts)
                 return (
                     classify_security(
                         authority,
@@ -651,10 +955,14 @@ class Swarm:
                         allow_active_mint=bool(config["strategy"].get("allow_active_mint")),
                     ),
                     quote,
+                    authority,
+                    dossier,
+                    x_handle,
                 )
 
+            t_anal_start = utcnow()
             try:
-                momentum, (security, quote) = await asyncio.wait_for(
+                momentum, (security, quote, authority, dossier, x_handle) = await asyncio.wait_for(
                     _gather(_momentum(), _security()),
                     timeout=self.settings.agent_timeout_seconds,
                 )
@@ -668,13 +976,105 @@ class Swarm:
                         mode=mode,
                         mint=row.mint,
                         now=now,
-                        payload={"reason": "agent_timeout"},
+                        payload={"seat": "CHIEF", "phase": "timeout", "reason": "agent_timeout"},
                     )
                     self._touch(session, "orchestrator", "timeout", "HOLD", now, now, error="agent timeout")
                 continue
+            t_anal_done = utcnow()
 
-            reports[row.mint] = (momentum, security, quote)
+            funnel_stats["webs_spun"] += 1
+            ck = None
+            if not fk and not tk:
+                ck = chain_kill(
+                    row,
+                    authority,
+                    hard,
+                    top_10_pct=dossier.top_10_percent if dossier else None,
+                    allow_active_mint=bool(config["strategy"].get("allow_active_mint")),
+                )
+                if ck:
+                    funnel_stats["chain"][ck] = funnel_stats["chain"].get(ck, 0) + 1
+            if security.classification == "fail":
+                funnel_stats["rugs_killed"] += 1
+
+            # Optional JEV System One typed judgements (never faked when TYPESAFE_API_KEY is absent).
+            jev_answers: dict = {}
+            jev_model_used: str | None = None
+            sk: str | None = None
+            if self.jev.available and mode == "live" and not (fk or tk or ck):
+                try:
+                    market_state = {
+                        "ticker": row.symbol,
+                        "age_minutes": round((now - row.pool_created_at).total_seconds() / 60, 1) if row.pool_created_at else None,
+                        "holder_count": row.holder_count,
+                        "liquidity_usd": float(row.pool_liquidity_usd) if row.pool_liquidity_usd is not None else None,
+                        "mcap_usd": float(row.market_cap_usd) if row.market_cap_usd is not None else None,
+                        "volume_m5": float(row.volume_m5) if row.volume_m5 is not None else None,
+                        "volume_h1": float(row.volume_h1) if row.volume_h1 is not None else None,
+                        "buys_m5": row.buys_m5,
+                        "sells_m5": row.sells_m5,
+                        "change": {
+                            "5m": float(row.price_change_m5) if row.price_change_m5 is not None else None,
+                            "1h": float(row.price_change_h1) if row.price_change_h1 is not None else None,
+                        },
+                        "intended_ticket_usd": float(limits.max_new_trade_usd),
+                    }
+                    m_rec = await self.jev.ask("market", market_state)
+                    if m_rec:
+                        jev_answers.update(m_rec.answers)
+                        jev_model_used = m_rec.resolved_model
+                    c_state = {
+                        "mint_authority_active": authority.mint_authority_active if authority else None,
+                        "freeze_authority_active": authority.freeze_authority_active if authority else None,
+                        "top_wallet_percent": float(authority.top_holder_pct) if authority and authority.top_holder_pct is not None else None,
+                        "top_10_percent": float(dossier.top_10_percent) if dossier and dossier.top_10_percent is not None else None,
+                        "developer_holding_percentage": float(dossier.dev_hold_percent) if dossier and dossier.dev_hold_percent is not None else None,
+                        "holder_count": row.holder_count,
+                    }
+                    c_rec = await self.jev.ask("solana", c_state)
+                    if c_rec:
+                        jev_answers.update(c_rec.answers)
+                        jev_model_used = c_rec.resolved_model
+                    sk = soft_kill(jev_answers, soft)
+                    if sk:
+                        funnel_stats["soft"][sk] = funnel_stats["soft"].get(sk, 0) + 1
+                    else:
+                        jev_survivors.append((row, jev_answers, correlation_id))
+                except ProviderError as exc:
+                    log.warning("jev judgement failed for %s: %s", row.symbol, exc.message)
+
             with session_scope() as session:
+                # Record bench entry for rejected tokens so bench view and optional skip logic stay accurate.
+                bench_reason = fk or tk or ck or sk or (security.critical_flags[0] if security.classification == "fail" and security.critical_flags else None)
+                bench_stage = "free_kill" if fk else ("trade_kill" if tk else ("chain_kill" if ck else ("soft_kill" if sk else "security")))
+                if bench_reason:
+                    self._sit_bench(
+                        session,
+                        mode=mode,
+                        mint=row.mint,
+                        symbol=row.symbol,
+                        reason=bench_reason,
+                        stage=bench_stage,
+                        now=now,
+                        details={"symbol": row.symbol, "flags": security.critical_flags},
+                    )
+
+                self._touch(
+                    session,
+                    "momentum",
+                    f"analyze {row.symbol}",
+                    f"{momentum.direction} ({momentum.score})",
+                    t_anal_start,
+                    t_anal_done,
+                )
+                self._touch(
+                    session,
+                    "security",
+                    f"vet {row.symbol}",
+                    f"{security.classification} ({security.score})",
+                    t_anal_start,
+                    t_anal_done,
+                )
                 self._emit(
                     session,
                     source="momentum",
@@ -684,13 +1084,20 @@ class Swarm:
                     mint=row.mint,
                     now=now,
                     payload={
+                        "seat": "SCAN",
+                        "phase": "trade_kill" if tk else ("free_kill" if fk else "momentum"),
+                        "symbol": row.symbol,
                         "score": momentum.score,
                         "direction": momentum.direction,
                         "completeness": momentum.completeness,
                         "confidence": momentum.confidence,
                         "reasons": momentum.reasons,
                         "indicators": momentum.indicators,
-                        "source": "deterministic",
+                        "free_kill": fk,
+                        "trade_kill": tk,
+                        "jev_shape": jev_answers.get("shape"),
+                        "jev_model": jev_model_used,
+                        "source": "jev+deterministic" if jev_model_used else "deterministic",
                     },
                 )
                 session.add(
@@ -716,14 +1123,48 @@ class Swarm:
                     mint=row.mint,
                     now=now,
                     payload={
+                        "seat": "VET",
+                        "phase": "chain_kill",
+                        "symbol": row.symbol,
                         "classification": security.classification,
                         "score": security.score,
                         "critical_flags": security.critical_flags,
                         "warning_flags": security.warning_flags,
+                        "chain_kill": ck,
+                        "top_holder_pct": format(authority.top_holder_pct, "f") if authority and authority.top_holder_pct is not None else None,
                         "explanation": security.explanation,
-                        "source": "deterministic",
+                        "jev_authority": jev_answers.get("authority_risk"),
+                        "jev_concentration": jev_answers.get("concentration_is_exit_risk"),
+                        "jev_dev_loaded": jev_answers.get("dev_still_loaded"),
+                        "jev_model": jev_model_used,
+                        "source": "jev+deterministic" if jev_model_used else "deterministic",
                     },
                 )
+                # SOCIAL seat event: strictly reports verified on-chain X handle or honest missing/unconfigured state.
+                self._emit(
+                    session,
+                    source="discovery",
+                    event_type="social.report",
+                    correlation_id=correlation_id,
+                    mode=mode,
+                    mint=row.mint,
+                    now=now,
+                    payload={
+                        "seat": "SOCIAL",
+                        "phase": "social",
+                        "symbol": row.symbol,
+                        "x_handle": x_handle,
+                        "status": "handle_verified_plugin_unconfigured" if x_handle else "no_verified_handle",
+                        "note": (
+                            f"On-chain X handle @{x_handle} verified; live X feed plugin not connected."
+                            if x_handle
+                            else "No verified on-chain X handle. Fan-account search is disabled."
+                        ),
+                        "size_factor": float(soft.get("no_social_cut", 0.60)) if not x_handle else 1.0,
+                        "source": "onchain_metadata",
+                    },
+                )
+
                 fee_bps = quote.fee_bps if quote and not quote.fail else None
                 state, equity, exposure, open_positions, _fresh = self._books(session, mode, now, limits)
                 decision = propose_entry(
@@ -742,6 +1183,47 @@ class Swarm:
                     max_fee_bps=limits.max_fee_bps,
                     allow_promoted=bool(config["strategy"].get("allow_promoted")),
                 )
+
+                # If JEV soft_kill rejected a token that deterministic rules would have proposed, record disagreement & hold.
+                det_outcome = decision.action
+                funnel_outcome = "kill" if (fk or tk or ck or sk) else decision.action
+                session.add(
+                    ShadowDecision(
+                        id=str(uuid.uuid4()),
+                        mode=mode,
+                        cycle_id=cycle_id,
+                        created_at=now,
+                        mint=row.mint,
+                        symbol=row.symbol,
+                        funnel_stage=bench_stage if bench_reason else "pick",
+                        funnel_outcome=funnel_outcome,
+                        deterministic_outcome=det_outcome,
+                        disagreement=(funnel_outcome != det_outcome),
+                        jev_model=jev_model_used,
+                        jev_answers=jev_answers or None,
+                        reasons=[r for r in (fk, tk, ck, sk) if r] or (decision.evidence.get("failures") or []),
+                        paper_notional=decision.notional,
+                    )
+                )
+
+                if sk and decision.action == "propose":
+                    decision.action = "hold"
+                    decision.thesis = f"JEV soft gate ({sk}) withheld entry before RiskEngine."
+                    decision.notional = None
+
+                size_info = compute_size_ticket(
+                    equity=equity,
+                    free_cash=q_usdc(state.cash - state.reserved),
+                    open_exposure=exposure,
+                    max_position_pct=limits.max_position_pct,
+                    max_exposure_pct=limits.max_exposure_pct,
+                    max_trade_usd=limits.max_new_trade_usd,
+                    pool_liquidity_usd=row.pool_liquidity_usd,
+                    size_factor=Decimal("1.0"),
+                    expected_fee_usd=quote.fee_usd if quote else Decimal("0.06"),
+                    max_fee_bps=limits.max_fee_bps,
+                )
+
                 proposal_id = str(uuid.uuid4())
                 pool_age = None
                 if row.pool_created_at is not None:
@@ -756,7 +1238,7 @@ class Swarm:
                         requested_notional=decision.notional or Decimal("0"),
                         strategy_version=STRATEGY_VERSION,
                         thesis=decision.thesis,
-                        evidence=decision.evidence,
+                        evidence={**decision.evidence, "jev_model": jev_model_used, "size_ticket": format(size_info.ticket_usd, "f")},
                         expected_costs=decision.expected_costs,
                         exit_conditions=decision.exit_conditions,
                         created_at=now,
@@ -774,12 +1256,63 @@ class Swarm:
                     mode=mode,
                     mint=row.mint,
                     now=now,
-                    payload={"action": decision.action, "thesis": decision.thesis, "notional": format(decision.notional, "f") if decision.notional else None, "source": "deterministic"},
+                    payload={
+                        "seat": "CHIEF",
+                        "phase": "pick" if decision.action == "propose" else "hold",
+                        "symbol": row.symbol,
+                        "action": decision.action,
+                        "thesis": decision.thesis,
+                        "notional": format(decision.notional, "f") if decision.notional else None,
+                        "size_pct_bank": format(size_info.pct_of_bank, "f"),
+                        "size_reason": size_info.reason,
+                        "jev_connected": self.jev.available,
+                        "jev_model": jev_model_used,
+                        "source": "jev+deterministic" if jev_model_used else "deterministic",
+                    },
                 )
-                commentary = None
                 if decision.action != "propose":
                     self._touch(session, "strategy", row.symbol, "HOLD", now, now)
                     continue
+
+                funnel_stats["picked"] = row.symbol
+                self._touch(session, "strategy", row.symbol, f"PICK {row.symbol}", now, now)
+                self._emit(
+                    session,
+                    source="strategy",
+                    event_type="size.ticket",
+                    correlation_id=correlation_id,
+                    mode=mode,
+                    mint=row.mint,
+                    now=now,
+                    payload={
+                        "seat": "SIZE",
+                        "phase": "size",
+                        "symbol": row.symbol,
+                        "ticket_usd": format(decision.notional or Decimal("0"), "f"),
+                        "pct_of_bank": format(size_info.pct_of_bank, "f"),
+                        "reason": size_info.reason,
+                    },
+                )
+
+                if shadow_mode:
+                    self._emit(
+                        session,
+                        source="orchestrator",
+                        event_type="shadow.logged_only",
+                        correlation_id=correlation_id,
+                        mode=mode,
+                        mint=row.mint,
+                        now=now,
+                        payload={
+                            "seat": "CHIEF",
+                            "phase": "shadow",
+                            "symbol": row.symbol,
+                            "notional": format(decision.notional or Decimal("0"), "f"),
+                            "note": "Shadow mode active: candidate logged to shadow_decisions without creating a paper order.",
+                        },
+                    )
+                    continue
+
                 open_same = (
                     session.scalar(
                         select(func.count())
@@ -807,7 +1340,7 @@ class Swarm:
                     .where(PaperOrder.mode == mode, PaperOrder.mint == row.mint, PaperOrder.side == "buy")
                     .order_by(desc(PaperOrder.created_at))
                 )
-                provider_ok = self.gecko.circuit.state != "open" and self.dex.circuit.state != "open"
+                provider_ok = self.gecko.circuit.state != "open" and self.dex.circuit.state != "open" and self.gmgn.client.circuit.state != "open"
                 risk = evaluate_entry(
                     now=now,
                     limits=limits,
@@ -864,7 +1397,14 @@ class Swarm:
                     mode=mode,
                     mint=row.mint,
                     now=now,
-                    payload={"approved": risk.approved, "reason_codes": risk.reason_codes, "explanation": risk.explanation},
+                    payload={
+                        "seat": "RISK",
+                        "phase": "risk_gate",
+                        "symbol": row.symbol,
+                        "approved": risk.approved,
+                        "reason_codes": risk.reason_codes,
+                        "explanation": risk.explanation,
+                    },
                 )
                 self._touch(session, "risk", row.symbol, "approve" if risk.approved else "veto", now, now)
                 if not risk.approved or state.emergency_stop:
@@ -893,6 +1433,7 @@ class Swarm:
                         "price_usd": format(quote.price_usd, "f") if quote else None,
                         "source": quote.source if quote else None,
                         "fee_source": plan.fee_source,
+                        "venue": "gmgn_paper" if (quote and quote.source == "gmgn_quote") else "paper_sim",
                     },
                     filled_notional=plan.filled_notional,
                     remaining_notional=plan.remaining_notional,
@@ -912,7 +1453,7 @@ class Swarm:
                         mode=mode,
                         mint=row.mint,
                         now=now,
-                        payload={"status": plan.status, "reason": plan.reason},
+                        payload={"seat": "FILLS", "phase": "fills", "symbol": row.symbol, "status": plan.status, "reason": plan.reason},
                     )
                     continue
                 fill = plan.fill
@@ -960,7 +1501,7 @@ class Swarm:
                         amount_usdc=-fill.spend,
                         cash_after=state.cash,
                         ref=order_id,
-                        memo=f"Paper buy {row.symbol} at quote. Fee source {plan.fee_source}.",
+                        memo=f"Paper buy {row.symbol} at quote ({plan.fee_source}).",
                     )
                 )
                 self._emit(
@@ -972,15 +1513,55 @@ class Swarm:
                     mint=row.mint,
                     now=now,
                     payload={
+                        "seat": "FILLS",
+                        "phase": "fills",
+                        "symbol": row.symbol,
                         "status": plan.status,
                         "price": format(fill.price, "f"),
                         "qty": format(fill.qty, "f"),
                         "fee": format(fill.fee, "f"),
                         "notional": format(fill.notional, "f"),
+                        "quote_source": quote.source if quote else None,
                     },
                 )
                 self._touch(session, "execution", f"buy {row.symbol}", plan.status, now, now)
-                _ = commentary
+
+        # If 2+ live JEV survivors exist, execute the single `pick` call and log it transparently.
+        if len(jev_survivors) >= 2 and self.jev.available:
+            try:
+                pick_candidates = [
+                    {
+                        "symbol": obs.symbol,
+                        "summary": (
+                            f"liq ${float(obs.pool_liquidity_usd or 0):,.0f}, "
+                            f"crowd {float((ans.get('shape') or {}).get('probabilities', {}).get('crowd', 0)):.2f}, "
+                            f"conc {float((ans.get('concentration_is_exit_risk') or {}).get('noul', 0)):.2f}"
+                        ),
+                    }
+                    for obs, ans, _ in jev_survivors
+                ]
+                pick_rec = await self.jev.ask("pick", {"candidates": pick_candidates})
+                if pick_rec:
+                    with session_scope() as session:
+                        self._emit(
+                            session,
+                            source="strategy",
+                            event_type="jev.pick",
+                            correlation_id=cycle_id,
+                            mode=mode,
+                            mint=None,
+                            now=now,
+                            payload={
+                                "seat": "CHIEF",
+                                "phase": "pick",
+                                "resolved_model": pick_rec.resolved_model,
+                                "answers": pick_rec.answers,
+                                "input_tokens": pick_rec.input_tokens,
+                                "estimated_cost_usd": pick_rec.estimated_cost_usd,
+                            },
+                        )
+            except ProviderError as exc:
+                log.warning("jev pick call failed: %s", exc.message)
 
         await self._monitor_exits(now, mode, limits)
         with session_scope() as session:
@@ -998,16 +1579,35 @@ class Swarm:
                     marks_fresh=fresh,
                 )
             )
+            session.add(
+                FunnelRun(
+                    id=cycle_id,
+                    mode=mode,
+                    created_at=now,
+                    held_symbol=None,
+                    shadow_mode=shadow_mode,
+                    jev_connected=self.jev.available,
+                    jev_model=self.jev.last_resolved_model,
+                    gmgn_configured=self.gmgn.configured,
+                    stats=funnel_stats,
+                    thresholds_snapshot={"hard": hard, "soft": soft},
+                )
+            )
             for snap in (
+                self.gmgn.snapshot(),
+                self.jev.snapshot(),
                 self.gecko.snapshot(),
                 self.dex.snapshot(),
                 self.jupiter.client.snapshot(),
                 self.rpc.client.snapshot(),
                 self.grok.client.snapshot(),
             ):
-                if mode == "demo":
+                if mode == "demo" and snap.provider not in {"jev", "gmgn", "grok"}:
                     snap.status = "not_used"
                     snap.detail = "Demo mode does not call this provider."
+                elif mode == "demo" and snap.provider == "gmgn" and not snap.configured:
+                    snap.status = "not_used"
+                    snap.detail = "Demo mode uses labeled fixtures; set GMGN_API_KEY for live GMGN feeds."
                 self._save_provider(session, snap)
             if state.emergency_stop:
                 self._alert(session, mode, "warning", "EMERGENCY_STOP", "New entries are paused. Open paper positions were not liquidated.", now, None)
@@ -1024,7 +1624,7 @@ class Swarm:
                     payload={"available": False, "source": "unavailable", "note": "Deterministic agent text is not Grok output."},
                 )
             self._touch(session, "orchestrator", "cycle", "complete", now, now)
-        return {"mode": mode, "candidates": len(scored)}
+        return {"mode": mode, "candidates": len(scored), "cycle_id": cycle_id}
 
     async def _monitor_exits(self, now: datetime, mode: str, limits: RiskLimits) -> None:
         with session_scope() as session:
@@ -1087,7 +1687,7 @@ class Swarm:
                             mode=mode,
                             mint=mint,
                             now=now,
-                            payload={"reason": signal},
+                            payload={"seat": "RISK", "phase": "unsellable", "reason": signal},
                         )
                 continue
             if not wants_exit or quote is None:
@@ -1101,7 +1701,6 @@ class Swarm:
                 current = session.get(Position, pos_id)
                 if state is None or current is None or current.status != "open" or plan.fill is None:
                     continue
-                # plan_sell used cash 0; apply proceeds onto the real cash balance.
                 state.cash = q_usdc(state.cash + plan.fill.proceeds)
                 current.qty = Decimal("0")
                 current.cost_basis = Decimal("0")
@@ -1156,6 +1755,16 @@ class Swarm:
                         memo=f"Paper sell ({signal}) at executable quote.",
                     )
                 )
+                self._emit(
+                    session,
+                    source="risk",
+                    event_type="risk.exit_release",
+                    correlation_id=pos_id,
+                    mode=mode,
+                    mint=mint,
+                    now=now,
+                    payload={"seat": "RISK", "phase": "release", "signal": signal, "realized_pnl": format(plan.fill.realized_pnl, "f")},
+                )
                 state.updated_at = now
 
     def _alert(self, session, mode: str, severity: str, code: str, message: str, now: datetime, mint: str | None) -> None:
@@ -1204,7 +1813,7 @@ class Swarm:
                 mode=mode,
                 mint=None,
                 now=now,
-                payload={"actor": actor, "cancelled_entries": cancelled, "positions_liquidated": False},
+                payload={"seat": "RISK", "actor": actor, "cancelled_entries": cancelled, "positions_liquidated": False},
             )
             open_positions = session.scalar(
                 select(func.count()).select_from(Position).where(Position.mode == mode, Position.status == "open")
@@ -1232,7 +1841,7 @@ class Swarm:
                 mode=mode,
                 mint=None,
                 now=now,
-                payload={"actor": actor, "positions_changed": False},
+                payload={"seat": "RISK", "actor": actor, "positions_changed": False},
             )
             return {"emergency_stop": False}
 
@@ -1240,16 +1849,29 @@ class Swarm:
         now = utcnow()
         with session_scope() as session:
             current = dict(self._config(session))
-            for section in ("scanner", "strategy", "risk", "simulation", "ai"):
+            for section in ("scanner", "strategy", "risk", "simulation", "ai", "thresholds"):
                 if section in patch and isinstance(patch[section], dict):
                     merged = dict(current.get(section) or {})
-                    merged.update(patch[section])
+                    if section == "thresholds":
+                        for sub in ("hard", "soft"):
+                            if isinstance(patch["thresholds"].get(sub), dict):
+                                merged[sub] = {**(merged.get(sub) or {}), **patch["thresholds"][sub]}
+                    else:
+                        merged.update(patch[section])
                     current[section] = merged
+            if "risk" in patch and "thresholds" not in patch:
+                th = dict(current.get("thresholds") or {})
+                hard = dict(th.get("hard") or DEFAULT_THRESHOLDS["hard"])
+                if "min_pool_liquidity_usd" in patch["risk"]:
+                    hard["min_liquidity_usd"] = float(patch["risk"]["min_pool_liquidity_usd"])
+                if "min_pool_age_minutes" in patch["risk"]:
+                    hard["min_age_minutes"] = int(patch["risk"]["min_pool_age_minutes"])
+                th["hard"] = hard
+                current["thresholds"] = th
             if "mode" in patch:
                 if patch["mode"] not in {"demo", "live"}:
                     raise ValueError("mode must be demo or live")
                 current["mode"] = patch["mode"]
-            # Re-validate risk by constructing limits. Rejects bad decimals.
             limits_from_config(current)
             row = session.get(AppSetting, "runtime")
             row.value = current

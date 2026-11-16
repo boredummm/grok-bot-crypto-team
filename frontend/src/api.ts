@@ -39,6 +39,31 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+const realtimeListeners = new Set<() => void>();
+let sharedEventSource: EventSource | null = null;
+
+export function openEventStream(onEvent: () => void): () => void {
+  const token = getToken();
+  if (!token || typeof EventSource === "undefined") return () => undefined;
+  realtimeListeners.add(onEvent);
+  if (!sharedEventSource) {
+    sharedEventSource = new EventSource(`/api/events/stream?token=${encodeURIComponent(token)}`);
+    sharedEventSource.onmessage = () => {
+      for (const fn of realtimeListeners) fn();
+    };
+    sharedEventSource.onerror = () => {
+      /* EventSource reconnects automatically */
+    };
+  }
+  return () => {
+    realtimeListeners.delete(onEvent);
+    if (realtimeListeners.size === 0 && sharedEventSource) {
+      sharedEventSource.close();
+      sharedEventSource = null;
+    }
+  };
+}
+
 export type Summary = {
   mode: "demo" | "live";
   data_label: string;
@@ -66,6 +91,8 @@ export type Summary = {
   last_scan_at: string | null;
   alerts_open: number;
   ai_commentary: string;
+  jev_status?: string;
+  gmgn_configured?: boolean;
 };
 
 export type Provider = {
@@ -75,6 +102,7 @@ export type Provider = {
   circuit: string;
   latency_ms: number | null;
   last_error: string | null;
+  detail?: string | null;
 };
 
 export type Tailscale = {
@@ -138,7 +166,7 @@ export type Order = {
   remaining_notional: string;
   reason: string | null;
   created_at: string;
-  quote: { source?: string; price_usd?: string } | null;
+  quote: { source?: string; price_usd?: string; venue?: string } | null;
   fills: { price: string; fee: string; fee_source: string; price_impact_bps: string | null }[];
 };
 
@@ -158,9 +186,218 @@ export type SwarmEvent = {
   id: string;
   at: string;
   source: string;
+  seat?: string | null;
   type: string;
   mint: string | null;
   correlation_id: string;
   sequence: number;
   payload: Record<string, unknown>;
+};
+
+export type SeatName = "CHIEF" | "SCAN" | "VET" | "SOCIAL" | "SIZE" | "FILLS" | "RISK" | "CRAWLER";
+
+export type SeatCard = {
+  seat: SeatName;
+  subtitle: string;
+  badge: string;
+  jev_connected: boolean;
+  status: string;
+  metric_label: string;
+  metric_value: string;
+  bar_ratio: number | null;
+  stats?: {
+    pages: number;
+    posts_read: number;
+    webs_spun: number;
+    rugs_killed: number;
+    benched: number;
+  };
+  log_line: string;
+  speech_bubble: string | null;
+  target_station: "desk" | "screen" | "center" | "chief";
+  active_mint: string | null;
+  active_symbol: string;
+  last_heartbeat: string | null;
+  processed: number;
+  errors: number;
+};
+
+export type CandlePoint = {
+  at: string;
+  time: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  up: boolean;
+  provider: string;
+};
+
+export type CandidateToken = {
+  mint: string;
+  symbol: string;
+  name: string;
+  holder_count: number | null;
+  promoted: boolean;
+  price: string | null;
+  liquidity: string | null;
+  market_cap: string | null;
+  volume_m5: string | null;
+  volume_h1: string | null;
+  change_m5: string | null;
+  change_h1: string | null;
+  buys_m5: number | null;
+  sells_m5: number | null;
+  discovery_score: number;
+  momentum_score: number | null;
+  security_status: string;
+  security_score: number | null;
+  critical_flags: string[];
+  top_holder_pct: string | null;
+  x_handle: string | null;
+  proposal_status: string;
+  provider: string | null;
+  observed_at: string | null;
+};
+
+export type FeaturedToken = CandidateToken & {
+  candles: CandlePoint[];
+  checks: { name: string; status: string; detail: string }[];
+};
+
+export type DeskState = {
+  mode: "demo" | "live";
+  data_label: string;
+  paper_trading: boolean;
+  live_execution_enabled: boolean;
+  emergency_stop: boolean;
+  emergency_stop_reason: string | null;
+  utc_now: string;
+  day_label: string;
+  clock_utc: string;
+  jev: {
+    connected: boolean;
+    configured: boolean;
+    status_label: string;
+    requested_model: string;
+    resolved_model: string | null;
+    total_calls: number;
+    total_input_tokens: number;
+    halted_reason: string | null;
+  };
+  gmgn: {
+    configured: boolean;
+    status: string;
+    detail: string | null;
+    venue_label: string;
+    live_swaps_enabled: boolean;
+  };
+  grok: {
+    configured: boolean;
+    status_label: string;
+  };
+  tailscale: Tailscale;
+  seats: SeatCard[];
+  featured_token: FeaturedToken | null;
+  candidates: CandidateToken[];
+  crawler_web: {
+    active: boolean;
+    source: string;
+    symbol: string | null;
+    mint: string | null;
+    callouts: string[];
+  };
+  balance: {
+    equity: string | null;
+    cash: string | null;
+    initial_equity: string;
+    daily_pnl: string | null;
+    total_pnl: string | null;
+    open_exposure: string | null;
+    max_drawdown: string | null;
+    open_positions: number;
+    held_symbol: string;
+    wins: number;
+    losses: number;
+    curve: { at: string; time: string; equity: number; delta: number; drawdown: number }[];
+  };
+  jev_analysis: {
+    scanned_count: number;
+    observations_total: number;
+    benched_count: number;
+    audit_rows: {
+      seq: number;
+      mint: string;
+      symbol: string;
+      stage: string;
+      reason: string;
+      status: string;
+      jev_model: string | null;
+      disagreement: boolean;
+      at: string;
+    }[];
+  };
+  thresholds: {
+    label: string;
+    disclaimer: string;
+    hard: Record<string, number>;
+    soft: Record<string, { dir: string; limit: number } | number>;
+    guide_inspiration: {
+      label: string;
+      disclaimer: string;
+      hard: Record<string, number>;
+    };
+    stage_counts: Record<string, number>;
+    stage_breakdown: Record<string, unknown>;
+    shadow_mode: boolean;
+    one_position_at_a_time: boolean;
+    use_bench: boolean;
+  };
+};
+
+export type SeatInspection = {
+  seat: SeatName;
+  logical_agent: string;
+  card: SeatCard;
+  heartbeat_age_seconds: number | null;
+  last_duration_ms: number | null;
+  last_error: string | null;
+  data_sources: {
+    mode: string;
+    gmgn: DeskState["gmgn"];
+    jev: DeskState["jev"];
+    grok: DeskState["grok"];
+  };
+  thresholds: {
+    hard: Record<string, number>;
+    soft: Record<string, unknown>;
+  };
+  recent_vetoes: {
+    at: string;
+    mint: string | null;
+    approved: boolean;
+    reason_codes: string[];
+    explanation: string;
+  }[];
+  events: SwarmEvent[];
+};
+
+export type DemoPlaybackStep = {
+  step: number;
+  phase: string;
+  clock: string;
+  active_seat: SeatName;
+  target: "desk" | "screen" | "center" | "chief";
+  mint: string;
+  symbol: string;
+  bubble: string;
+  crawler_web: boolean;
+  funnel_stage: string;
+};
+
+export type DemoPlaybackData = {
+  is_demo_playback: boolean;
+  label: string;
+  steps: DemoPlaybackStep[];
 };

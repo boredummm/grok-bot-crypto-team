@@ -13,7 +13,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db import JSONText, DecimalString, UTCDateTime, Base
+from app.db import Base, DecimalString, JSONText, UTCDateTime
 
 
 class SchemaMigration(Base):
@@ -303,3 +303,56 @@ class BacktestRun(Base):
     disclosure: Mapped[dict] = mapped_column(JSONText)
     results: Mapped[dict] = mapped_column(JSONText)
     strategy_version: Mapped[str] = mapped_column(String(64))
+
+
+class BenchEntry(Base):
+    """Reason-TTL rejection bench so failed checks are remembered across cycles."""
+
+    __tablename__ = "bench_entries"
+    __table_args__ = (UniqueConstraint("mode", "mint", name="uq_bench_mode_mint"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), index=True)
+    mint: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str] = mapped_column(String(64), index=True)
+    stage: Mapped[str] = mapped_column(String(32), index=True)
+    ttl_minutes: Mapped[int] = mapped_column(Integer)
+    benched_at: Mapped[object] = mapped_column(UTCDateTime)
+    until_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+    details: Mapped[dict | None] = mapped_column(JSONText, nullable=True)
+
+
+class FunnelRun(Base):
+    """Per-cycle funnel counters (`free_kill`, `trade_kill`, `chain_kill`, `soft_kill`, `pick`)."""
+
+    __tablename__ = "funnel_runs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), index=True)
+    created_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+    held_symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    shadow_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    jev_connected: Mapped[bool] = mapped_column(Boolean, default=False)
+    jev_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    gmgn_configured: Mapped[bool] = mapped_column(Boolean, default=False)
+    stats: Mapped[dict] = mapped_column(JSONText)
+    thresholds_snapshot: Mapped[dict] = mapped_column(JSONText)
+
+
+class ShadowDecision(Base):
+    """Shadow comparison record logging funnel/JEV judgement next to deterministic rules."""
+
+    __tablename__ = "shadow_decisions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), index=True)
+    cycle_id: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[object] = mapped_column(UTCDateTime, index=True)
+    mint: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    funnel_stage: Mapped[str] = mapped_column(String(32))
+    funnel_outcome: Mapped[str] = mapped_column(String(32))
+    deterministic_outcome: Mapped[str] = mapped_column(String(32))
+    disagreement: Mapped[bool] = mapped_column(Boolean, default=False)
+    jev_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    jev_answers: Mapped[dict | None] = mapped_column(JSONText, nullable=True)
+    reasons: Mapped[list] = mapped_column(JSONText)
+    paper_notional: Mapped[object | None] = mapped_column(DecimalString, nullable=True)

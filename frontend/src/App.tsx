@@ -32,8 +32,10 @@ import {
   api,
   clearToken,
   getToken,
+  openEventStream,
   setToken,
 } from "./api";
+import { RetroControlRoom } from "./components/RetroControlRoom";
 import { compact, money, pct, shortMint, signed, tone } from "./lib/format";
 
 function Login() {
@@ -54,7 +56,7 @@ function Login() {
     <div className="login">
       <form className="panel" onSubmit={submit}>
         <h1>SOL SWARM</h1>
-        <p className="muted">Paper trading only. No wallet, no signing, no live orders.</p>
+        <p className="muted">SOL SWARM + JEV · GMGN Paper trading only. No wallet, no signing, no live orders.</p>
         <label>
           Monitor or admin token
           <input value={value} onChange={(event) => setValue(event.target.value)} autoFocus style={{ width: "100%", marginTop: 6 }} />
@@ -73,17 +75,11 @@ function usePoll<T>(path: string, fallback: T): T {
     const load = () => api<T>(path).then((row) => { if (!stop) setData(row); }).catch(() => undefined);
     load();
     const timer = window.setInterval(load, 4000);
-    const token = getToken();
-    let socket: WebSocket | null = null;
-    if (token) {
-      const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      socket = new WebSocket(`${proto}://${window.location.host}/ws?token=${encodeURIComponent(token)}`);
-      socket.onmessage = () => load();
-    }
+    const closeSse = openEventStream(load);
     return () => {
       stop = true;
       window.clearInterval(timer);
-      socket?.close();
+      closeSse();
     };
   }, [path]);
   return data;
@@ -112,16 +108,16 @@ function Shell({ children }: { children: ReactNode }) {
     <div className="app-shell">
       <aside className="nav">
         <div className="brand">
-          <strong>SOL SWARM</strong>
-          <span>Paper research desk</span>
+          <strong>SOL SWARM HQ</strong>
+          <span>GMGN · JEV paper desk</span>
         </div>
-        <NavLink to="/" end><Gauge size={16} /> Overview</NavLink>
-        <NavLink to="/radar"><RadarIcon size={16} /> Radar</NavLink>
-        <NavLink to="/agents"><Activity size={16} /> Agents</NavLink>
-        <NavLink to="/terminal"><Wallet size={16} /> Terminal</NavLink>
-        <NavLink to="/analytics"><LineChart size={16} /> Analytics</NavLink>
-        <NavLink to="/replay"><Shield size={16} /> Replay</NavLink>
-        <NavLink to="/settings"><SettingsIcon size={16} /> Settings</NavLink>
+        <NavLink to="/" end><Gauge size={15} /> Control Room</NavLink>
+        <NavLink to="/radar"><RadarIcon size={15} /> Radar</NavLink>
+        <NavLink to="/agents"><Activity size={15} /> Agents &amp; Bench</NavLink>
+        <NavLink to="/terminal"><Wallet size={15} /> Terminal</NavLink>
+        <NavLink to="/analytics"><LineChart size={15} /> Analytics</NavLink>
+        <NavLink to="/replay"><Shield size={15} /> Replay</NavLink>
+        <NavLink to="/settings"><SettingsIcon size={15} /> Settings</NavLink>
       </aside>
       <div className="main">
         <header className="topbar">
@@ -132,6 +128,9 @@ function Shell({ children }: { children: ReactNode }) {
             </span>
             <span className={summary?.emergency_stop ? "pill bad" : "pill good"}>
               {summary?.emergency_stop ? "ENTRIES PAUSED" : "ENTRIES OPEN"}
+            </span>
+            <span className={summary?.jev_status === "connected" ? "pill good" : "pill"}>
+              {summary?.jev_status === "connected" ? "JEV CONNECTED" : "JEV NOT CONNECTED"}
             </span>
             <TailPill data={summary?.tailscale} />
           </div>
@@ -163,39 +162,7 @@ function TailPill({ data }: { data?: Tailscale }) {
 function Overview() {
   const summary = usePoll<Summary | null>("/api/summary", null);
   const providers = usePoll<Provider[]>("/api/providers", []);
-  if (!summary) return <p className="muted">Loading book…</p>;
-  return (
-    <>
-      <section className="grid">
-        <Metric label="Equity" value={money(summary.equity)} />
-        <Metric label="Daily P&L" value={summary.daily_pnl_available ? signed(summary.daily_pnl) : "—"} tone={tone(summary.daily_pnl)} />
-        <Metric label="Total P&L" value={summary.total_pnl_available ? signed(summary.total_pnl) : "—"} tone={tone(summary.total_pnl)} />
-        <Metric label="Win rate" value={summary.win_rate_available ? pct(Number(summary.win_rate) * 100) : "—"} hint={summary.win_rate_available ? "" : "No closed trades"} />
-        <Metric label="Profit factor" value={summary.profit_factor_available ? Number(summary.profit_factor).toFixed(2) : "—"} hint={summary.profit_factor_available ? "" : "Needs wins and losses"} />
-        <Metric label="Open exposure" value={money(summary.open_exposure)} />
-        <Metric label="Max drawdown" value={summary.max_drawdown_available ? pct(Number(summary.max_drawdown) * 100) : "—"} />
-        <Metric label="Agents" value={String(summary.active_agents)} hint={`${summary.alerts_open} open alerts`} />
-      </section>
-      <section className="split">
-        <div className="panel">
-          <h2>Market data</h2>
-          <p className="muted">{summary.data_label}. Last scan {summary.last_scan_at || "not yet"}.</p>
-          <p className="muted">AI commentary: {summary.ai_commentary}. Deterministic notes are not labeled as Grok.</p>
-          {providers.map((row) => (
-            <div key={row.provider} className="event">
-              <strong>{row.provider}</strong>
-              <span className={row.status === "ok" ? "up" : "muted"}>{row.configured ? row.status : "unconfigured"}</span>
-              <span className="muted">{row.last_error || row.circuit}</span>
-            </div>
-          ))}
-        </div>
-        <div className="panel">
-          <h2>Tailscale</h2>
-          <TailscaleCard data={summary.tailscale} />
-        </div>
-      </section>
-    </>
-  );
+  return <RetroControlRoom summary={summary} providers={providers} />;
 }
 
 function Metric({ label, value, hint, tone: color }: { label: string; value: string; hint?: string; tone?: "up" | "down" | "flat" }) {
@@ -205,16 +172,6 @@ function Metric({ label, value, hint, tone: color }: { label: string; value: str
       <div className={`value ${color === "up" ? "up" : color === "down" ? "down" : ""}`}>{value}</div>
       {hint && <div className="muted">{hint}</div>}
     </article>
-  );
-}
-
-function TailscaleCard({ data }: { data: Tailscale }) {
-  return (
-    <>
-      <p>{data.detail}</p>
-      <p className="mono muted">{data.dns_name || "no MagicDNS name"}</p>
-      <p className="muted">Serve {data.serve_enabled ? "enabled" : "off"} · Funnel {data.funnel_enabled ? "ON" : "off"}</p>
-    </>
   );
 }
 
@@ -285,6 +242,8 @@ function Radar() {
 function Agents() {
   const agents = usePoll<Agent[]>("/api/agents", []);
   const events = usePoll<SwarmEvent[]>("/api/events", []);
+  const bench = usePoll<{ mint: string; symbol: string; reason: string; stage: string; ttl_minutes: number; active: boolean; until_at: string }[]>("/api/bench", []);
+  const shadow = usePoll<{ total_logged: number; disagreements: number; rows: { id: string; symbol: string; funnel_stage: string; funnel_outcome: string; deterministic_outcome: string; disagreement: boolean }[] } | null>("/api/shadow", null);
   return (
     <>
       <div className="agents">
@@ -298,13 +257,39 @@ function Agents() {
           </article>
         ))}
       </div>
+      <div className="split">
+        <div className="panel">
+          <h2>Rejection Bench (Reason-Specific TTLs)</h2>
+          {bench.length === 0 && <p className="muted">No rejected tokens on the bench yet.</p>}
+          {bench.map((b) => (
+            <div key={b.mint} className="event">
+              <strong>{b.symbol}</strong>
+              <span className="down">{b.stage} · {b.reason}</span>
+              <span className="muted">TTL {b.ttl_minutes}m · {b.active ? "active" : "expired"}</span>
+            </div>
+          ))}
+        </div>
+        <div className="panel">
+          <h2>Shadow Comparison Journal</h2>
+          <p className="muted">
+            {shadow ? `${shadow.total_logged} logged · ${shadow.disagreements} disagreements` : "Loading…"}
+          </p>
+          {shadow?.rows.slice(0, 8).map((r) => (
+            <div key={r.id} className="event">
+              <strong>{r.symbol}</strong>
+              <span>{r.funnel_stage}: {r.funnel_outcome}</span>
+              <span className={r.disagreement ? "down" : "muted"}>det: {r.deterministic_outcome}</span>
+            </div>
+          ))}
+        </div>
+      </div>
       <div className="panel">
         <h2>Event timeline</h2>
         <div className="timeline">
           {events.map((event) => (
             <div className="event" key={event.id}>
               <span className="mono muted">{event.at.slice(11, 19)} · {event.sequence}</span>
-              <span style={{ color: "var(--purple)" }}>{event.source}</span>
+              <span style={{ color: "var(--purple)" }}>{event.seat || event.source}</span>
               <span>{event.type} {event.mint ? `· ${event.mint}` : ""}</span>
             </div>
           ))}
@@ -393,7 +378,7 @@ function Analytics() {
               <XAxis dataKey="time" stroke="#8d99ab" />
               <YAxis stroke="#8d99ab" domain={["auto", "auto"]} />
               <Tooltip />
-              <Area dataKey="equity" stroke="#67e8f9" fill="rgba(103,232,249,0.15)" />
+              <Area dataKey="equity" stroke="#00e676" fill="rgba(0,230,118,0.15)" />
             </AreaChart>
           </ResponsiveContainer>
         ) : <p className="muted">No equity snapshots yet.</p>}
@@ -403,7 +388,7 @@ function Analytics() {
           <h2>Quoted price impact</h2>
           {slips.length ? (
             <ResponsiveContainer width="100%" height={170}>
-              <BarChart data={slips}><XAxis dataKey="index" stroke="#8d99ab" /><YAxis stroke="#8d99ab" /><Bar dataKey="bps" fill="#c4b5fd" /></BarChart>
+              <BarChart data={slips}><XAxis dataKey="index" stroke="#8d99ab" /><YAxis stroke="#8d99ab" /><Bar dataKey="bps" fill="#ff4eb0" /></BarChart>
             </ResponsiveContainer>
           ) : <p className="muted">No fills yet.</p>}
         </div>
@@ -449,7 +434,7 @@ function TokenPage() {
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={chart.map((row) => ({ time: row.at.slice(11, 16), price: Number(row.price) }))}>
                 <XAxis dataKey="time" stroke="#8d99ab" /><YAxis stroke="#8d99ab" domain={["auto", "auto"]} /><Tooltip />
-                <Area dataKey="price" stroke="#3dd68c" fill="rgba(61,214,140,0.12)" />
+                <Area dataKey="price" stroke="#00e676" fill="rgba(0,230,118,0.12)" />
               </AreaChart>
             </ResponsiveContainer>
           ) : <p>No chart points.</p>}
@@ -500,7 +485,7 @@ function Replay() {
       {curve.length > 0 && (
         <div style={{ height: 220 }}>
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={curve}><XAxis dataKey="time" stroke="#8d99ab" /><YAxis stroke="#8d99ab" /><Tooltip /><Area dataKey="equity" stroke="#c4b5fd" fill="rgba(196,181,253,0.15)" /></AreaChart>
+            <AreaChart data={curve}><XAxis dataKey="time" stroke="#8d99ab" /><YAxis stroke="#8d99ab" /><Tooltip /><Area dataKey="equity" stroke="#ff4eb0" fill="rgba(255,78,176,0.15)" /></AreaChart>
           </ResponsiveContainer>
         </div>
       )}
@@ -516,7 +501,13 @@ function SettingsPage() {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const patch = {
-      scanner: { interval_seconds: Number(form.get("interval")), max_candidates: Number(form.get("candidates")) },
+      scanner: {
+        interval_seconds: Number(form.get("interval")),
+        max_candidates: Number(form.get("candidates")),
+        shadow_mode: form.get("shadow_mode") === "on",
+        one_position_at_a_time: form.get("one_position_at_a_time") === "on",
+        use_bench: form.get("use_bench") === "on",
+      },
       strategy: { momentum_threshold: Number(form.get("momentum")) },
       risk: {
         max_new_trade_usd: String(form.get("trade")),
@@ -543,21 +534,23 @@ function SettingsPage() {
     }
   }
   const risk = (current?.risk as Record<string, string | number>) || {};
-  const scanner = (current?.scanner as Record<string, number>) || {};
+  const scanner = (current?.scanner as Record<string, number | boolean>) || {};
   const strategy = (current?.strategy as Record<string, number>) || {};
   const simulation = (current?.simulation as Record<string, string>) || {};
   const providers = (current?.providers as Record<string, boolean>) || {};
   return (
     <form className="panel" key={current ? "loaded" : "empty"} onSubmit={save}>
       <h2>Paper settings</h2>
-      <p className="muted">Mode {String(current?.mode || "…")}. Jupiter configured: {String(providers.jupiter_configured)}. Grok configured: {String(providers.xai_configured)}. Keys are never shown.</p>
+      <p className="muted">
+        Mode {String(current?.mode || "…")} · GMGN configured: {String(Boolean(providers.gmgn_configured))} · TypeSafe JEV configured: {String(Boolean(providers.typesafe_jev_configured))} · Jupiter configured: {String(Boolean(providers.jupiter_configured))} · Grok configured: {String(Boolean(providers.xai_configured))}. Keys are never shown.
+      </p>
       <div className="toolbar">
         <button type="button" className="ghost" onClick={() => mode("demo")}>Demo mode</button>
         <button type="button" className="ghost" onClick={() => mode("live")}>Live data mode</button>
       </div>
       <div className="grid">
-        <label>Scan seconds<input name="interval" defaultValue={scanner.interval_seconds ?? 60} /></label>
-        <label>Max candidates<input name="candidates" defaultValue={scanner.max_candidates ?? 8} /></label>
+        <label>Scan seconds<input name="interval" defaultValue={Number(scanner.interval_seconds ?? 60)} /></label>
+        <label>Max candidates<input name="candidates" defaultValue={Number(scanner.max_candidates ?? 8)} /></label>
         <label>Momentum threshold<input name="momentum" defaultValue={strategy.momentum_threshold ?? 65} /></label>
         <label>Max trade USD<input name="trade" defaultValue={risk.max_new_trade_usd ?? "20"} /></label>
         <label>Min liquidity<input name="liquidity" defaultValue={risk.min_pool_liquidity_usd ?? "50000"} /></label>
@@ -565,6 +558,11 @@ function SettingsPage() {
         <label>Daily loss fraction<input name="daily" defaultValue={risk.daily_loss_pct ?? "0.03"} /></label>
         <label>Drawdown fraction<input name="drawdown" defaultValue={risk.drawdown_pct ?? "0.10"} /></label>
         <label>Assumed network fee<input name="fee" defaultValue={simulation.network_fee_usdc ?? "0.02"} /></label>
+      </div>
+      <div className="toolbar" style={{ marginTop: 12 }}>
+        <label><input type="checkbox" name="shadow_mode" defaultChecked={Boolean(scanner.shadow_mode)} /> Shadow mode (log picks without paper fills)</label>
+        <label><input type="checkbox" name="one_position_at_a_time" defaultChecked={Boolean(scanner.one_position_at_a_time)} /> One position at a time (pause scan while held)</label>
+        <label><input type="checkbox" name="use_bench" defaultChecked={Boolean(scanner.use_bench)} /> Enforce rejection bench TTLs</label>
       </div>
       <button className="action" type="submit">Save settings</button>
       {note && <p>{note}</p>}

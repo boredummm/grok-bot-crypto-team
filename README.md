@@ -1,12 +1,12 @@
-# SOL SWARM
+# SOL SWARM + JEV (GMGN Paper Control Room)
 
-Local Solana memecoin research and paper trading. The app discovers tokens, scores momentum, checks mint authorities, and simulates entries only after a deterministic risk veto. It does not create wallets, store seed phrases, sign transactions, or submit them.
+Local Solana memecoin research and paper-trading desk with a top-down 2D pixel-art control room (`SOL SWARM + JEV`). The system discovers Solana tokens, runs deterministic stage gates (`free_kill -> trade_kill -> chain_kill -> soft_kill -> pick`), optionally calls TypeSafe System One (`JEV`) for typed `noul` / `choice` / `score` judgements when `TYPESAFE_API_KEY` is provided, and simulates paper entries only after the independent deterministic `RiskEngine` approves them.
 
-Demo mode runs from labeled fixtures and needs no API keys. Live data mode reads GeckoTerminal, DexScreener, optional Jupiter quotes, and Solana RPC. Without a Jupiter key, live mode still scans but will not invent a fill.
+It does not create wallets, accept trading private keys, sign transactions, or execute live swaps. GMGN is integrated strictly via its official read-only OpenAPI (`Exist Auth`) for market, security, kline, and paper quote simulation.
 
 ## Start
 
-Windows:
+Windows PowerShell:
 
 ```powershell
 .\scripts\start.ps1
@@ -21,15 +21,22 @@ bash scripts/start.sh
 Dashboard: http://127.0.0.1:5173  
 API: http://127.0.0.1:8000
 
-The start script writes `SOLSWARM_ADMIN_TOKEN` and `SOLSWARM_MONITOR_TOKEN` into `.env` when they are empty. Paste one into the dashboard. The monitor token is read-only. The admin token can pause entries and edit paper settings.
+`start.ps1` and `start.sh` generate distinct `SOLSWARM_ADMIN_TOKEN` and `SOLSWARM_MONITOR_TOKEN` secrets into `.env` without printing them. Paste either token into the dashboard login gate. Monitor tokens are read-only; admin tokens are required to pause/resume entries, edit `thresholds.py` / settings, or trigger scans.
 
-Tailnet access: see [docs/TAILSCALE.md](docs/TAILSCALE.md). Serve only. Funnel is not used.
+Tailnet access: see [docs/TAILSCALE.md](docs/TAILSCALE.md). Private Tailscale Serve only. Funnel is never enabled.
+
+## Optional Credentials (`.env`)
+
+- `GMGN_API_KEY`: Read-only GMGN OpenAPI key from `https://gmgn.ai/ai` (`X-APIKEY` + `timestamp` + `client_id` UUID). Unlocks GMGN Solana trending (`GET /v1/market/rank`), token info/security (`GET /v1/token/info`, `GET /v1/token/security`), candlesticks (`GET /v1/market/token_kline`), and read-only paper swap quotes (`GET /v1/trade/quote`). Swap/write endpoints are blocked at the backend service boundary.
+- `TYPESAFE_API_KEY`: TypeSafe System One key (`POST https://api.typesafe.ai/v1/systemone`, default `jev-latest`). Unlocks live `market`, `solana`, and `pick` typed judgements. Without it, the desk displays `JEV NOT CONNECTED` and runs deterministic gates without faking model outputs.
+- `JUPITER_API_KEY`: Secondary quote fallback (`GET /swap/v2/order` with transaction blob stripped).
+- `XAI_API_KEY`: Optional Grok commentary seat (`grok-4-fast`). Never overrides risk limits or authorizes trades.
 
 ## Tests
 
 ```bash
 cd backend && ../.venv/bin/pytest -q
-cd frontend && npm test
+cd frontend && npm test && npm run build
 ```
 
 ## Docs
@@ -38,12 +45,3 @@ cd frontend && npm test
 - [Risk model](docs/RISK_MODEL.md)
 - [API](docs/API.md)
 - [Tailscale](docs/TAILSCALE.md)
-
-## Assumptions
-
-- Canonical identity is the mint address.
-- USDC notionals use 6-decimal integer quotes from Jupiter and decimal accounting internally.
-- A Jupiter order response includes a transaction. That field is discarded. The order is not executed.
-- Birdeye and Grok are optional. Missing credentials stay visible as unavailable.
-- Demo performance is not live performance. The books are separate.
-- Default limits are experimental controls, not a claim that the strategy makes money.

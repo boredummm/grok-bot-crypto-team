@@ -37,6 +37,12 @@ class Settings(BaseSettings):
         default="https://api.mainnet-beta.solana.com",
         alias="SOLANA_RPC_URL",
     )
+    gmgn_api_key: str = Field(default="", alias="GMGN_API_KEY")
+    gmgn_base_url: str = Field(default="https://openapi.gmgn.ai", alias="GMGN_BASE_URL")
+    typesafe_api_key: str = Field(default="", alias="TYPESAFE_API_KEY")
+    typesafe_model: str = Field(default="jev-latest", alias="TYPESAFE_DEFAULT_MODEL")
+    typesafe_base_url: str = Field(default="https://api.typesafe.ai", alias="TYPESAFE_BASE_URL")
+
     jupiter_api_key: str = Field(default="", alias="JUPITER_API_KEY")
     birdeye_api_key: str = Field(default="", alias="BIRDEYE_API_KEY")
     xai_api_key: str = Field(default="", alias="XAI_API_KEY")
@@ -52,7 +58,15 @@ class Settings(BaseSettings):
     initial_equity: Decimal = Field(default=Decimal("1000"))
 
     def secret_values(self) -> list[str]:
-        values = [self.admin_token, self.monitor_token, self.jupiter_api_key, self.birdeye_api_key, self.xai_api_key]
+        values = [
+            self.admin_token,
+            self.monitor_token,
+            self.gmgn_api_key,
+            self.typesafe_api_key,
+            self.jupiter_api_key,
+            self.birdeye_api_key,
+            self.xai_api_key,
+        ]
         return [item for item in values if item and len(item) >= 6]
 
     def require_tokens(self) -> None:

@@ -36,6 +36,6 @@ fi
 if [[ ! -d frontend/node_modules ]]; then
   (cd frontend && npm install)
 fi
-(cd backend && ../.venv/bin/python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000) &
+(cd backend && ../.venv/bin/python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 2) &
 (cd frontend && npm run dev -- --host 127.0.0.1 --port 5173) &
 wait

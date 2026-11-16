@@ -1,22 +1,27 @@
-"""Read models for the dashboard and the monitor API. Secrets are never included."""
+"""Read models for the dashboard, 8-seat retro control room, and monitor API. Secrets are never included."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import desc, func, select
 
 from app.accounting import position_mark_value
 from app.config import Settings
 from app.db import session_scope
+from app.funnel import DEFAULT_THRESHOLDS, GUIDE_INSPIRATION_THRESHOLDS, SEAT_ORDER, demo_playback_frames
 from app.models import (
     AgentEvent,
     AgentHealth,
     Alert,
     AppSetting,
+    BacktestRun,
+    BenchEntry,
     ConfigVersion,
     EquitySnapshot,
+    FunnelRun,
     LedgerEntry,
     MarketObservation,
     PaperFill,
@@ -26,13 +31,24 @@ from app.models import (
     ProviderHealth,
     RiskDecision,
     SecurityAssessment,
+    ShadowDecision,
     StrategyProposal,
     Token,
 )
-from app.money import decimal_str, q_usdc
-from app.risk import RiskLimits
+from app.money import q_usdc
 from app.swarm import Swarm, limits_from_config
 from app.tailscale_status import tailscale_health
+
+SEAT_AGENT_MAP = {
+    "CHIEF": "orchestrator",
+    "SCAN": "momentum",
+    "VET": "security",
+    "SOCIAL": "discovery",
+    "SIZE": "strategy",
+    "FILLS": "execution",
+    "RISK": "risk",
+    "CRAWLER": "discovery",
+}
 
 
 def _s(value) -> str | None:
@@ -55,17 +71,21 @@ def _equity(session, mode: str, now: datetime) -> dict:
     if state is None:
         return {}
     limits = limits_from_config(session.get(AppSetting, "runtime").value)
-    positions = session.scalars(select(Position).where(Position.mode == mode, Position.status.in_(("open", "unsellable")))).all()
+    positions_rows = session.scalars(
+        select(Position).where(Position.mode == mode, Position.status.in_(("open", "unsellable")))
+    ).all()
     exposure = Decimal("0")
     fresh = True
-    for pos in positions:
+    for pos in positions_rows:
         obs = session.scalar(
             select(MarketObservation)
             .where(MarketObservation.mode == mode, MarketObservation.mint == pos.mint)
             .order_by(desc(MarketObservation.observed_at))
         )
         mark = obs.price_usd if obs else None
-        mark_fresh = bool(obs and mark is not None and (now - obs.observed_at).total_seconds() <= limits.market_max_age_seconds)
+        mark_fresh = bool(
+            obs and mark is not None and (now - obs.observed_at).total_seconds() <= limits.market_max_age_seconds
+        )
         value, is_fresh = position_mark_value(cost_basis=pos.cost_basis, qty=pos.qty, mark=mark, mark_fresh=mark_fresh)
         exposure += value
         fresh = fresh and is_fresh
@@ -100,11 +120,18 @@ def summary(settings: Settings, swarm: Swarm) -> dict:
         if closed:
             win_rate = Decimal(len(wins)) / Decimal(len(closed))
         if losses:
-            profit_factor = (sum((row.realized_pnl for row in wins), Decimal("0")) / abs(sum((row.realized_pnl for row in losses), Decimal("0")))) if wins else Decimal("0")
-        agents = session.scalars(select(AgentHealth)).all()
-        active = sum(1 for row in agents if row.status in {"ok", "idle", "running"})
-        providers = session.scalars(select(ProviderHealth)).all()
-        last_scan = session.scalar(select(func.max(MarketObservation.observed_at)).where(MarketObservation.mode == mode))
+            profit_factor = (
+                sum((row.realized_pnl for row in wins), Decimal("0"))
+                / abs(sum((row.realized_pnl for row in losses), Decimal("0")))
+                if wins
+                else Decimal("0")
+            )
+        agents_rows = session.scalars(select(AgentHealth)).all()
+        active = sum(1 for row in agents_rows if row.status in {"ok", "idle", "running"})
+        providers_rows = session.scalars(select(ProviderHealth)).all()
+        last_scan = session.scalar(
+            select(func.max(MarketObservation.observed_at)).where(MarketObservation.mode == mode)
+        )
         open_alerts = session.scalar(
             select(func.count()).select_from(Alert).where(Alert.mode == mode, Alert.acknowledged == False)  # noqa: E712
         )
@@ -131,14 +158,18 @@ def summary(settings: Settings, swarm: Swarm) -> dict:
             "max_drawdown_available": state is not None,
             "marks_fresh": book.get("marks_fresh", False),
             "open_positions": len(
-                session.scalars(select(Position).where(Position.mode == mode, Position.status.in_(("open", "unsellable")))).all()
+                session.scalars(
+                    select(Position).where(Position.mode == mode, Position.status.in_(("open", "unsellable")))
+                ).all()
             ),
             "active_agents": active,
-            "provider_health": [_provider(row) for row in providers],
+            "provider_health": [_provider(row) for row in providers_rows],
             "tailscale": tailscale_health(),
             "last_scan_at": last_scan.isoformat() if last_scan else None,
             "alerts_open": int(open_alerts or 0),
             "ai_commentary": "unavailable" if not settings.xai_api_key else "configured",
+            "jev_status": "connected" if swarm.jev.available else "not_connected",
+            "gmgn_configured": bool(settings.gmgn_api_key),
         }
 
 
@@ -153,6 +184,794 @@ def _provider(row: ProviderHealth) -> dict:
         "last_error": row.last_error,
         "detail": row.detail,
     }
+
+
+def _candles_from_observations(obs_rows: list[MarketObservation], limit: int = 28) -> list[dict]:
+    """Build deterministic OHLC candles from sequential observed prints without inventing prices."""
+    pts = [r for r in obs_rows if r.price_usd is not None][-limit:]
+    candles: list[dict] = []
+    for idx, row in enumerate(pts):
+        close_p = float(row.price_usd)
+        open_p = float(pts[idx - 1].price_usd) if idx > 0 and pts[idx - 1].price_usd is not None else close_p
+        high_p = max(open_p, close_p)
+        low_p = min(open_p, close_p)
+        vol = float(row.volume_m5) if row.volume_m5 is not None else 0.0
+        candles.append(
+            {
+                "at": row.observed_at.isoformat(),
+                "time": row.observed_at.strftime("%H:%M"),
+                "open": round(open_p, 8),
+                "high": round(high_p, 8),
+                "low": round(low_p, 8),
+                "close": round(close_p, 8),
+                "volume": round(vol, 2),
+                "up": close_p >= open_p,
+                "provider": row.provider,
+            }
+        )
+    return candles
+
+
+def desk_state(settings: Settings, swarm: Swarm) -> dict[str, Any]:
+    """Complete state for the top-down pixel-art SOL SWARM + JEV Control Room."""
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        mode = _mode(session)
+        runtime = (session.get(AppSetting, "runtime").value or {}) if session.get(AppSetting, "runtime") else {}
+        hard, soft = swarm._thresholds(runtime)
+        scanner_cfg = runtime.get("scanner") or {}
+        book = _equity(session, mode, now)
+        state = book.get("state")
+
+        closed = session.scalars(select(Position).where(Position.mode == mode, Position.status == "closed")).all()
+        open_pos = session.scalars(
+            select(Position).where(Position.mode == mode, Position.status.in_(("open", "unsellable"))).order_by(desc(Position.opened_at))
+        ).all()
+        wins = sum(1 for r in closed if r.realized_pnl > 0)
+        losses = sum(1 for r in closed if r.realized_pnl < 0)
+
+        first_ledger = session.scalar(
+            select(LedgerEntry).where(LedgerEntry.mode == mode).order_by(LedgerEntry.created_at)
+        )
+        day_num = 1
+        if first_ledger and first_ledger.created_at:
+            day_num = max(1, (now.date() - first_ledger.created_at.date()).days + 1)
+
+        latest_funnel = session.scalar(
+            select(FunnelRun).where(FunnelRun.mode == mode).order_by(desc(FunnelRun.created_at))
+        )
+        funnel_stats = (latest_funnel.stats if latest_funnel else None) or {
+            "seen": 0,
+            "benched": 0,
+            "free": {},
+            "trade": {},
+            "chain": {},
+            "soft": {},
+            "picked": None,
+            "pages_read": 0,
+            "rugs_killed": 0,
+            "webs_spun": 0,
+        }
+
+        total_obs_count = int(
+            session.scalar(select(func.count()).select_from(MarketObservation).where(MarketObservation.mode == mode))
+            or 0
+        )
+        total_sec_fails = int(
+            session.scalar(
+                select(func.count(func.distinct(SecurityAssessment.mint)))
+                .where(SecurityAssessment.mode == mode, SecurityAssessment.classification == "fail")
+            )
+            or 0
+        )
+        active_bench_count = int(
+            session.scalar(
+                select(func.count()).select_from(BenchEntry).where(BenchEntry.mode == mode, BenchEntry.until_at > now)
+            )
+            or 0
+        )
+
+        tokens_all = session.scalars(select(Token).where(Token.mode == mode)).all()
+        token_summaries: list[dict[str, Any]] = []
+        for tok in tokens_all:
+            obs = session.scalar(
+                select(MarketObservation)
+                .where(MarketObservation.mode == mode, MarketObservation.mint == tok.mint)
+                .order_by(desc(MarketObservation.observed_at), desc(MarketObservation.discovery_score))
+            )
+            sec = session.scalar(
+                select(SecurityAssessment)
+                .where(SecurityAssessment.mode == mode, SecurityAssessment.mint == tok.mint)
+                .order_by(desc(SecurityAssessment.observed_at))
+            )
+            prop = session.scalar(
+                select(StrategyProposal)
+                .where(StrategyProposal.mode == mode, StrategyProposal.mint == tok.mint)
+                .order_by(desc(StrategyProposal.created_at))
+            )
+            mom_ev = session.scalar(
+                select(AgentEvent)
+                .where(AgentEvent.mode == mode, AgentEvent.mint == tok.mint, AgentEvent.event_type == "momentum.report")
+                .order_by(desc(AgentEvent.created_at))
+            )
+            sec_ev = session.scalar(
+                select(AgentEvent)
+                .where(AgentEvent.mode == mode, AgentEvent.mint == tok.mint, AgentEvent.event_type == "security.report")
+                .order_by(desc(AgentEvent.created_at))
+            )
+            soc_ev = session.scalar(
+                select(AgentEvent)
+                .where(AgentEvent.mode == mode, AgentEvent.mint == tok.mint, AgentEvent.event_type == "social.report")
+                .order_by(desc(AgentEvent.created_at))
+            )
+            token_summaries.append(
+                {
+                    "mint": tok.mint,
+                    "symbol": tok.symbol,
+                    "name": tok.name,
+                    "holder_count": tok.holder_count,
+                    "promoted": tok.promoted,
+                    "price": _s(obs.price_usd) if obs else None,
+                    "liquidity": _s(obs.pool_liquidity_usd) if obs else None,
+                    "market_cap": _s(obs.market_cap_usd) if obs else None,
+                    "volume_m5": _s(obs.volume_m5) if obs else None,
+                    "volume_h1": _s(obs.volume_h1) if obs else None,
+                    "change_m5": _s(obs.price_change_m5) if obs else None,
+                    "change_h1": _s(obs.price_change_h1) if obs else None,
+                    "buys_m5": obs.buys_m5 if obs else None,
+                    "sells_m5": obs.sells_m5 if obs else None,
+                    "discovery_score": obs.discovery_score if obs else 0,
+                    "momentum_score": (mom_ev.payload or {}).get("score") if mom_ev else None,
+                    "security_status": sec.classification if sec else "unknown",
+                    "security_score": sec.score if sec else None,
+                    "critical_flags": sec.critical_flags if sec else [],
+                    "top_holder_pct": (sec_ev.payload or {}).get("top_holder_pct") if sec_ev else None,
+                    "x_handle": (soc_ev.payload or {}).get("x_handle") if soc_ev else None,
+                    "proposal_status": prop.status if prop else "observed",
+                    "provider": obs.provider if obs else None,
+                    "observed_at": obs.observed_at.isoformat() if obs else None,
+                }
+            )
+        token_summaries.sort(key=lambda r: int(r.get("discovery_score") or 0), reverse=True)
+
+        # Pick featured token: open position first, else highest-scoring candidate.
+        featured_mint = open_pos[0].mint if open_pos else (token_summaries[0]["mint"] if token_summaries else None)
+        featured = next((t for t in token_summaries if t["mint"] == featured_mint), None)
+        featured_candles: list[dict] = []
+        featured_checks: list[dict] = []
+        if featured:
+            obs_history = session.scalars(
+                select(MarketObservation)
+                .where(MarketObservation.mode == mode, MarketObservation.mint == featured["mint"])
+                .order_by(MarketObservation.observed_at)
+            ).all()
+            featured_candles = _candles_from_observations(obs_history)
+            liq_val = Decimal(featured["liquidity"]) if featured.get("liquidity") else Decimal("0")
+            liq_ok = liq_val >= Decimal(str(hard.get("min_liquidity_usd", 50000)))
+            sec_stat = featured["security_status"]
+            featured_checks = [
+                {
+                    "name": "liquidity depth",
+                    "status": "PASS" if liq_ok else "DROP",
+                    "detail": f"${float(liq_val):,.0f} vs ${float(hard.get('min_liquidity_usd', 50000)):,.0f}",
+                },
+                {
+                    "name": "holder spread",
+                    "status": "PASS" if (featured.get("top_holder_pct") and float(featured["top_holder_pct"]) <= float(hard.get("max_top_wallet", 0.25)) * 100) else ("UNKNOWN" if not featured.get("top_holder_pct") else "DROP"),
+                    "detail": f"top {featured.get('top_holder_pct') or '?'}%",
+                },
+                {
+                    "name": "authority safety",
+                    "status": "PASS" if sec_stat == "pass" else ("DROP" if sec_stat == "fail" else "UNKNOWN"),
+                    "detail": ", ".join(featured["critical_flags"]) if featured["critical_flags"] else "mint+freeze checked",
+                },
+                {
+                    "name": "trade flow",
+                    "status": "PASS" if (featured.get("buys_m5") or 0) > (featured.get("sells_m5") or 0) else "WAIT",
+                    "detail": f"{featured.get('buys_m5') or 0}B / {featured.get('sells_m5') or 0}S (5m)",
+                },
+                {
+                    "name": "social x handle",
+                    "status": "VERIFIED" if featured.get("x_handle") else "NONE",
+                    "detail": f"@{featured['x_handle']}" if featured.get("x_handle") else "no on-chain handle",
+                },
+                {
+                    "name": "jev judgement",
+                    "status": "CONNECTED" if swarm.jev.available else "OFFLINE",
+                    "detail": swarm.jev.last_resolved_model or "JEV NOT CONNECTED",
+                },
+            ]
+
+        # Build recent events and map each of the 8 seats to its latest genuine backend state.
+        recent_events = session.scalars(
+            select(AgentEvent).where(AgentEvent.mode == mode).order_by(desc(AgentEvent.created_at)).limit(80)
+        ).all()
+        health_map = {row.agent_name: row for row in session.scalars(select(AgentHealth)).all()}
+        last_order = session.scalar(
+            select(PaperOrder).where(PaperOrder.mode == mode).order_by(desc(PaperOrder.created_at))
+        )
+        last_fill = (
+            session.scalar(select(PaperFill).where(PaperFill.order_id == last_order.id).order_by(desc(PaperFill.filled_at)))
+            if last_order
+            else None
+        )
+
+        latest_by_seat: dict[str, AgentEvent] = {}
+        for ev in recent_events:
+            seat = (ev.payload or {}).get("seat")
+            if seat in SEAT_ORDER and seat not in latest_by_seat:
+                latest_by_seat[seat] = ev
+
+        equity_val = book.get("equity") or Decimal("1000")
+        max_ticket = min(
+            q_usdc(equity_val * Decimal(str((runtime.get("risk") or {}).get("max_position_pct", "0.02")))),
+            Decimal(str((runtime.get("risk") or {}).get("max_new_trade_usd", "20"))),
+        )
+        ticket_pct = (max_ticket / equity_val * Decimal("100")).quantize(Decimal("0.1")) if equity_val > 0 else Decimal("0")
+
+        jev_ok = swarm.jev.available
+        paused = bool(state.emergency_stop) if state else False
+        seats = _build_seats(
+            now=now,
+            mode=mode,
+            jev_ok=jev_ok,
+            paused=paused,
+            featured=featured,
+            open_pos=open_pos,
+            wins=wins,
+            losses=losses,
+            max_ticket=max_ticket,
+            ticket_pct=ticket_pct,
+            last_order=last_order,
+            last_fill=last_fill,
+            funnel_stats=funnel_stats,
+            total_obs_count=total_obs_count,
+            total_sec_fails=total_sec_fails,
+            active_bench_count=active_bench_count,
+            latest_by_seat=latest_by_seat,
+            health_map=health_map,
+            soft=soft,
+        )
+
+        # Build equity curve + delta bars from actual EquitySnapshots (never invented gains).
+        snaps = session.scalars(
+            select(EquitySnapshot).where(EquitySnapshot.mode == mode).order_by(EquitySnapshot.created_at).limit(60)
+        ).all()
+        curve: list[dict[str, Any]] = []
+        for idx, snap in enumerate(snaps):
+            eq_f = float(snap.equity)
+            prev_f = float(snaps[idx - 1].equity) if idx > 0 else float(state.initial_equity if state else snap.equity)
+            curve.append(
+                {
+                    "at": snap.created_at.isoformat(),
+                    "time": snap.created_at.strftime("%H:%M:%S"),
+                    "equity": eq_f,
+                    "delta": round(eq_f - prev_f, 4),
+                    "drawdown": float(snap.drawdown),
+                }
+            )
+
+        # Audit log rows for JEV · ANALYSIS bottom table.
+        shadows = session.scalars(
+            select(ShadowDecision).where(ShadowDecision.mode == mode).order_by(desc(ShadowDecision.created_at)).limit(12)
+        ).all()
+        audit_rows = [
+            {
+                "seq": idx + 1,
+                "mint": row.mint,
+                "symbol": row.symbol,
+                "stage": row.funnel_stage,
+                "reason": (row.reasons[0] if row.reasons else "clean_pass"),
+                "status": "PASS" if row.deterministic_outcome == "propose" else "DROP",
+                "jev_model": row.jev_model,
+                "disagreement": row.disagreement,
+                "at": row.created_at.isoformat(),
+            }
+            for idx, row in enumerate(shadows)
+        ]
+
+        # Crawler investigation web — active only when a recent scan occurred within the last 90s.
+        last_sweep = latest_by_seat.get("CRAWLER")
+        sweep_fresh = bool(last_sweep and (now - last_sweep.created_at).total_seconds() <= 90)
+        crawler_web = {
+            "active": sweep_fresh and featured is not None,
+            "source": "live_cycle_event" if mode == "live" else "demo_cycle_event",
+            "symbol": featured["symbol"] if featured else None,
+            "mint": featured["mint"] if featured else None,
+            "callouts": [
+                f"liq ${float(featured['liquidity'] or 0):,.0f}" if featured else "idle",
+                f"security: {featured['security_status']}" if featured else "idle",
+                f"x_handle: {'@' + featured['x_handle'] if featured and featured.get('x_handle') else 'none'}",
+            ]
+            if featured
+            else [],
+        }
+
+        stage_counts = {
+            "free_kill": sum((funnel_stats.get("free") or {}).values()),
+            "trade_kill": sum((funnel_stats.get("trade") or {}).values()),
+            "chain_kill": sum((funnel_stats.get("chain") or {}).values()),
+            "soft_kill": sum((funnel_stats.get("soft") or {}).values()),
+            "pick": 1 if funnel_stats.get("picked") else 0,
+        }
+
+        return {
+            "mode": mode,
+            "data_label": "DEMO FIXTURES (PAPER)" if mode == "demo" else "LIVE PROVIDERS (PAPER)",
+            "paper_trading": True,
+            "live_execution_enabled": False,
+            "emergency_stop": paused,
+            "emergency_stop_reason": state.emergency_stop_reason if state else None,
+            "utc_now": now.isoformat(),
+            "day_label": f"DAY {day_num} · {now.strftime('%b %d').upper()}",
+            "clock_utc": now.strftime("%H:%M UTC"),
+            "jev": {
+                "connected": jev_ok,
+                "configured": bool(settings.typesafe_api_key),
+                "status_label": f"JEV · {swarm.jev.last_resolved_model or settings.typesafe_model}" if jev_ok else "JEV NOT CONNECTED",
+                "requested_model": settings.typesafe_model,
+                "resolved_model": swarm.jev.last_resolved_model,
+                "total_calls": swarm.jev.total_calls,
+                "total_input_tokens": swarm.jev.total_input_tokens,
+                "halted_reason": swarm.jev.halted_422_reason,
+            },
+            "gmgn": {
+                "configured": bool(settings.gmgn_api_key),
+                "status": swarm.gmgn.snapshot().status,
+                "detail": swarm.gmgn.snapshot().detail,
+                "venue_label": "GMGN PAPER QUOTE" if settings.gmgn_api_key else "GMGN KEY NOT SET (SECONDARY FEEDS)",
+                "live_swaps_enabled": False,
+            },
+            "grok": {
+                "configured": bool(settings.xai_api_key),
+                "status_label": f"GROK ({settings.xai_model})" if settings.xai_api_key else "GROK UNCONFIGURED",
+            },
+            "tailscale": tailscale_health(),
+            "seats": seats,
+            "featured_token": {
+                **(featured or {}),
+                "candles": featured_candles,
+                "checks": featured_checks,
+            }
+            if featured
+            else None,
+            "candidates": token_summaries[:5],
+            "crawler_web": crawler_web,
+            "balance": {
+                "equity": _s(book.get("equity")),
+                "cash": _s(state.cash) if state else None,
+                "initial_equity": _s(state.initial_equity) if state else "1000.000000",
+                "daily_pnl": _s(book.get("daily_pnl")),
+                "total_pnl": _s(book.get("total_pnl")),
+                "open_exposure": _s(book.get("exposure")),
+                "max_drawdown": _s(book.get("drawdown")),
+                "open_positions": len(open_pos),
+                "held_symbol": featured["symbol"] if (open_pos and featured) else (featured["symbol"] if featured else "NONE"),
+                "wins": wins,
+                "losses": losses,
+                "curve": curve,
+            },
+            "jev_analysis": {
+                "scanned_count": len(token_summaries),
+                "observations_total": total_obs_count,
+                "benched_count": active_bench_count,
+                "audit_rows": audit_rows,
+            },
+            "thresholds": {
+                "label": DEFAULT_THRESHOLDS["label"],
+                "disclaimer": DEFAULT_THRESHOLDS["disclaimer"],
+                "hard": hard,
+                "soft": soft,
+                "guide_inspiration": GUIDE_INSPIRATION_THRESHOLDS,
+                "stage_counts": stage_counts,
+                "stage_breakdown": {
+                    "free_kill": funnel_stats.get("free") or {},
+                    "trade_kill": funnel_stats.get("trade") or {},
+                    "chain_kill": funnel_stats.get("chain") or {},
+                    "soft_kill": funnel_stats.get("soft") or {},
+                    "picked": funnel_stats.get("picked"),
+                },
+                "shadow_mode": bool(scanner_cfg.get("shadow_mode", False)),
+                "one_position_at_a_time": bool(scanner_cfg.get("one_position_at_a_time", False)),
+                "use_bench": bool(scanner_cfg.get("use_bench", False)),
+            },
+        }
+
+
+def _build_seats(
+    *,
+    now: datetime,
+    mode: str,
+    jev_ok: bool,
+    paused: bool,
+    featured: dict | None,
+    open_pos: list[Position],
+    wins: int,
+    losses: int,
+    max_ticket: Decimal,
+    ticket_pct: Decimal,
+    last_order: PaperOrder | None,
+    last_fill: PaperFill | None,
+    funnel_stats: dict,
+    total_obs_count: int,
+    total_sec_fails: int,
+    active_bench_count: int,
+    latest_by_seat: dict[str, AgentEvent],
+    health_map: dict[str, AgentHealth],
+    soft: dict,
+) -> list[dict[str, Any]]:
+    sym = featured["symbol"] if featured else "NONE"
+    picked = funnel_stats.get("picked")
+
+    def _hb(agent_key: str) -> tuple[str | None, int, int, str]:
+        h = health_map.get(agent_key)
+        if not h:
+            return None, 0, 0, "idle"
+        return (
+            h.last_heartbeat.isoformat() if h.last_heartbeat else None,
+            h.processed_count,
+            h.error_count,
+            h.status,
+        )
+
+    chief_ev = latest_by_seat.get("CHIEF")
+    chief_hb, chief_proc, chief_err, chief_st = _hb("orchestrator")
+    chief_pick_text = f"last pick {picked}" if picked else (f"holding {open_pos[0].mint}" if open_pos else "standing down · no pick")
+    if open_pos and featured:
+        chief_pick_text = f"last pick {featured['symbol']}"
+
+    scan_ev = latest_by_seat.get("SCAN")
+    scan_hb, scan_proc, scan_err, scan_st = _hb("momentum")
+    mom_score = (featured.get("momentum_score") if featured else None)
+    scan_norm = round(float(mom_score) / 100.0, 2) if mom_score is not None else None
+    scan_jev = ((scan_ev.payload or {}).get("jev_shape") or {}) if scan_ev else {}
+    if scan_jev and isinstance(scan_jev.get("probabilities"), dict):
+        scan_val = f"{float(scan_jev['probabilities'].get('crowd', 0)):.2f}"
+        scan_metric_lbl = f"shape.crowd · {sym}"
+        scan_bar = float(scan_jev["probabilities"].get("crowd", 0))
+    else:
+        scan_val = f"{scan_norm:.2f}" if scan_norm is not None else "—"
+        scan_metric_lbl = f"momentum.det · {sym}"
+        scan_bar = scan_norm
+
+    vet_ev = latest_by_seat.get("VET")
+    vet_hb, vet_proc, vet_err, vet_st = _hb("security")
+    vet_jev = ((vet_ev.payload or {}).get("jev_dev_loaded") or {}) if vet_ev else {}
+    if vet_jev and "noul" in vet_jev:
+        vet_val = f"{float(vet_jev['noul']):.2f}"
+        vet_lbl = f"dev_still_loaded · {sym}"
+        vet_bar = float(vet_jev["noul"])
+    else:
+        sec_score = featured.get("security_score") if featured else None
+        vet_bar = round(float(sec_score) / 100.0, 2) if sec_score is not None else None
+        vet_val = (featured.get("security_status") or "unknown").upper() if featured else "IDLE"
+        vet_lbl = f"chain_safety · {sym}"
+
+    soc_ev = latest_by_seat.get("SOCIAL")
+    soc_payload = (soc_ev.payload or {}) if soc_ev else {}
+    x_handle = soc_payload.get("x_handle") or (featured.get("x_handle") if featured else None)
+    soc_val = f"@{x_handle}" if x_handle else "NO HANDLE"
+    soc_lbl = f"x_account · {sym}"
+
+    size_hb, size_proc, size_err, size_st = _hb("strategy")
+    fills_ev = latest_by_seat.get("FILLS")
+    fills_hb, fills_proc, fills_err, fills_st = _hb("execution")
+    if last_order and last_fill:
+        fill_val = f"{last_order.side} ${float(last_fill.notional):.2f} @ ${float(last_fill.price):.2f}"
+        fill_log = f"fee ${float(last_fill.fee):.2f} ({last_fill.fee_source}) · paper only"
+        fill_bar = 1.0
+    elif last_order and last_order.status != "filled":
+        fill_val = f"{last_order.status}"
+        fill_log = last_order.rejection_reason or "quote unavailable"
+        fill_bar = 0.2
+    else:
+        fill_val = "waiting on a pick"
+        fill_log = "no live swap route enabled · paper quotes only"
+        fill_bar = 0.0
+
+    risk_ev = latest_by_seat.get("RISK")
+    risk_hb, risk_proc, risk_err, risk_st = _hb("risk")
+    risk_log = (
+        "EMERGENCY STOP — new entries paused"
+        if paused
+        else ((risk_ev.payload or {}).get("explanation") if risk_ev else "independent deterministic veto armed")
+    )
+
+    crawl_ev = latest_by_seat.get("CRAWLER")
+    crawl_hb, crawl_proc, crawl_err, crawl_st = _hb("discovery")
+    evaluated = int(funnel_stats.get("evaluated") or 0)
+    seen = int(funnel_stats.get("seen") or 0)
+
+    return [
+        {
+            "seat": "CHIEF",
+            "subtitle": "never takes a position",
+            "badge": "JEV PICK" if jev_ok else "JEV OFF · DET",
+            "jev_connected": jev_ok,
+            "status": "paused" if paused else chief_st,
+            "metric_label": "question set · pick" if jev_ok else "mode · deterministic",
+            "metric_value": chief_pick_text,
+            "bar_ratio": 0.75 if picked else 0.25,
+            "log_line": (
+                f"worth >= {soft.get('pick_min_worth', 0.60):.2f} · conf >= {soft.get('pick_min_conf', 0.55):.2f}"
+                if jev_ok
+                else "JEV NOT CONNECTED · deterministic strategy gate"
+            ),
+            "speech_bubble": f"pick: {picked}" if picked else None,
+            "target_station": "chief",
+            "active_mint": featured["mint"] if featured else None,
+            "active_symbol": sym,
+            "last_heartbeat": chief_hb,
+            "processed": chief_proc,
+            "errors": chief_err,
+        },
+        {
+            "seat": "SCAN",
+            "subtitle": "finding what moves",
+            "badge": "ASKS JEV" if jev_ok else "MATH ONLY",
+            "jev_connected": jev_ok,
+            "status": scan_st,
+            "metric_label": scan_metric_lbl,
+            "metric_value": scan_val,
+            "bar_ratio": scan_bar,
+            "log_line": (
+                ((scan_ev.payload or {}).get("reasons") or ["scanning Solana pools"])[0]
+                if scan_ev
+                else "waiting for candidate sweep"
+            ),
+            "speech_bubble": f"scoring {sym} ({scan_val})" if featured else None,
+            "target_station": "screen" if featured else "desk",
+            "active_mint": featured["mint"] if featured else None,
+            "active_symbol": sym,
+            "last_heartbeat": scan_hb,
+            "processed": scan_proc,
+            "errors": scan_err,
+        },
+        {
+            "seat": "VET",
+            "subtitle": "chain risk, is it real",
+            "badge": "ASKS JEV" if jev_ok else "RPC + GMGN",
+            "jev_connected": jev_ok,
+            "status": vet_st,
+            "metric_label": vet_lbl,
+            "metric_value": vet_val,
+            "bar_ratio": vet_bar,
+            "log_line": (
+                (vet_ev.payload or {}).get("explanation")
+                if vet_ev
+                else "checking mint & freeze authorities"
+            ),
+            "speech_bubble": (
+                f"{total_sec_fails} rugs blocked" if total_sec_fails else f"{sym}: {vet_val}"
+            ),
+            "target_station": "center" if total_sec_fails else "desk",
+            "active_mint": (vet_ev.mint if vet_ev else None) or (featured["mint"] if featured else None),
+            "active_symbol": sym,
+            "last_heartbeat": vet_hb,
+            "processed": vet_proc,
+            "errors": vet_err,
+        },
+        {
+            "seat": "SOCIAL",
+            "subtitle": "the project's X account",
+            "badge": "ASKS JEV" if jev_ok else "HANDLE ONLY",
+            "jev_connected": jev_ok,
+            "status": "unconfigured" if not jev_ok else "idle",
+            "metric_label": soc_lbl,
+            "metric_value": soc_val,
+            "bar_ratio": 0.5 if x_handle else 0.0,
+            "log_line": soc_payload.get("note") or "no X feed plugin · never guesses fan accounts",
+            "speech_bubble": f"handle @{x_handle}" if x_handle else None,
+            "target_station": "desk",
+            "active_mint": featured["mint"] if featured else None,
+            "active_symbol": sym,
+            "last_heartbeat": soc_ev.created_at.isoformat() if soc_ev else None,
+            "processed": crawl_proc,
+            "errors": 0,
+        },
+        {
+            "seat": "SIZE",
+            "subtitle": "how much",
+            "badge": "MATH",
+            "jev_connected": False,
+            "status": size_st,
+            "metric_label": f"ticket {ticket_pct}%",
+            "metric_value": f"${float(max_ticket):,.2f}",
+            "bar_ratio": min(1.0, float(ticket_pct) / 6.0),
+            "log_line": f"max ${float(max_ticket):.0f} · <=2% bank · <=1% pool",
+            "speech_bubble": f"ticket ${float(max_ticket):.0f}" if picked else None,
+            "target_station": "desk",
+            "active_mint": featured["mint"] if featured else None,
+            "active_symbol": sym,
+            "last_heartbeat": size_hb,
+            "processed": size_proc,
+            "errors": size_err,
+        },
+        {
+            "seat": "FILLS",
+            "subtitle": "execution (paper)",
+            "badge": "GMGN PAPER",
+            "jev_connected": False,
+            "status": fills_st,
+            "metric_label": "last paper fill",
+            "metric_value": fill_val,
+            "bar_ratio": fill_bar,
+            "log_line": fill_log,
+            "speech_bubble": fill_val if last_fill else None,
+            "target_station": "center" if last_fill else "desk",
+            "active_mint": last_order.mint if last_order else None,
+            "active_symbol": sym,
+            "last_heartbeat": fills_hb,
+            "processed": fills_proc,
+            "errors": fills_err,
+        },
+        {
+            "seat": "RISK",
+            "subtitle": "closing & final veto",
+            "badge": "FINAL VETO",
+            "jev_connected": False,
+            "status": "paused" if paused else risk_st,
+            "metric_label": f"open {len(open_pos)} · closed",
+            "metric_value": f"{wins}W {losses}L",
+            "bar_ratio": 1.0 if paused else (0.65 if open_pos else 0.25),
+            "log_line": str(risk_log)[:96],
+            "speech_bubble": "PAUSED — positions kept" if paused else (f"holding {len(open_pos)} open" if open_pos else None),
+            "target_station": "screen" if (paused or open_pos) else "desk",
+            "active_mint": open_pos[0].mint if open_pos else None,
+            "active_symbol": sym,
+            "last_heartbeat": risk_hb,
+            "processed": risk_proc,
+            "errors": risk_err,
+        },
+        {
+            "seat": "CRAWLER",
+            "subtitle": "reads first, then the desk trades",
+            "badge": f"TAPS {evaluated}/{max(seen, evaluated, 1)}",
+            "jev_connected": False,
+            "status": crawl_st,
+            "metric_label": "observations",
+            "metric_value": str(total_obs_count),
+            "bar_ratio": min(1.0, evaluated / 8.0) if evaluated else 0.15,
+            "stats": {
+                "pages": total_obs_count,
+                "posts_read": 0,
+                "webs_spun": int(funnel_stats.get("webs_spun") or 0),
+                "rugs_killed": total_sec_fails,
+                "benched": active_bench_count,
+            },
+            "log_line": (
+                f"swept {funnel_stats.get('pages_read', 0)} pools ({(crawl_ev.payload or {}).get('source', mode)})"
+                if crawl_ev
+                else "idle · awaiting scan cycle"
+            ),
+            "speech_bubble": f"swept {seen} mints",
+            "target_station": "screen",
+            "active_mint": featured["mint"] if featured else None,
+            "active_symbol": sym,
+            "last_heartbeat": crawl_hb,
+            "processed": crawl_proc,
+            "errors": crawl_err,
+        },
+    ]
+
+
+def seat_inspector(seat_name: str, settings: Settings, swarm: Swarm) -> dict[str, Any] | None:
+    seat_upper = seat_name.strip().upper()
+    if seat_upper not in SEAT_ORDER:
+        return None
+    desk = desk_state(settings, swarm)
+    seat_card = next((s for s in desk["seats"] if s["seat"] == seat_upper), None)
+    agent_key = SEAT_AGENT_MAP[seat_upper]
+    now = datetime.now(timezone.utc)
+
+    with session_scope() as session:
+        mode = _mode(session)
+        health = session.get(AgentHealth, agent_key)
+        all_recent = session.scalars(
+            select(AgentEvent).where(AgentEvent.mode == mode).order_by(desc(AgentEvent.created_at)).limit(120)
+        ).all()
+        seat_events = [
+            _event(row)
+            for row in all_recent
+            if (row.payload or {}).get("seat") == seat_upper or row.source_agent == agent_key
+        ][:25]
+        vetoes = [
+            {
+                "at": r.created_at.isoformat(),
+                "mint": r.mint,
+                "approved": r.approved,
+                "reason_codes": r.reason_codes,
+                "explanation": r.explanation,
+            }
+            for r in session.scalars(
+                select(RiskDecision).where(RiskDecision.mode == mode).order_by(desc(RiskDecision.created_at)).limit(10)
+            ).all()
+        ]
+        heartbeat_age = (
+            round((now - health.last_heartbeat).total_seconds(), 1)
+            if (health and health.last_heartbeat)
+            else None
+        )
+
+    return {
+        "seat": seat_upper,
+        "logical_agent": agent_key,
+        "card": seat_card,
+        "heartbeat_age_seconds": heartbeat_age,
+        "last_duration_ms": health.last_duration_ms if health else None,
+        "last_error": health.last_error if health else None,
+        "data_sources": {
+            "mode": desk["mode"],
+            "gmgn": desk["gmgn"],
+            "jev": desk["jev"],
+            "grok": desk["grok"],
+        },
+        "thresholds": {
+            "hard": desk["thresholds"]["hard"],
+            "soft": desk["thresholds"]["soft"],
+        },
+        "recent_vetoes": vetoes,
+        "events": seat_events,
+    }
+
+
+def bench_list() -> list[dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        mode = _mode(session)
+        rows = session.scalars(
+            select(BenchEntry).where(BenchEntry.mode == mode).order_by(desc(BenchEntry.benched_at)).limit(50)
+        ).all()
+        return [
+            {
+                "mint": r.mint,
+                "symbol": r.symbol,
+                "reason": r.reason,
+                "stage": r.stage,
+                "ttl_minutes": r.ttl_minutes,
+                "active": r.until_at > now,
+                "benched_at": r.benched_at.isoformat(),
+                "until_at": r.until_at.isoformat(),
+                "details": r.details,
+            }
+            for r in rows
+        ]
+
+
+def shadow_list() -> dict[str, Any]:
+    with session_scope() as session:
+        mode = _mode(session)
+        rows = session.scalars(
+            select(ShadowDecision).where(ShadowDecision.mode == mode).order_by(desc(ShadowDecision.created_at)).limit(50)
+        ).all()
+        disagreements = sum(1 for r in rows if r.disagreement)
+        return {
+            "mode": mode,
+            "total_logged": len(rows),
+            "disagreements": disagreements,
+            "rows": [
+                {
+                    "id": r.id,
+                    "cycle_id": r.cycle_id,
+                    "at": r.created_at.isoformat(),
+                    "mint": r.mint,
+                    "symbol": r.symbol,
+                    "funnel_stage": r.funnel_stage,
+                    "funnel_outcome": r.funnel_outcome,
+                    "deterministic_outcome": r.deterministic_outcome,
+                    "disagreement": r.disagreement,
+                    "jev_model": r.jev_model,
+                    "jev_answers": r.jev_answers,
+                    "reasons": r.reasons,
+                    "paper_notional": _s(r.paper_notional),
+                }
+                for r in rows
+            ],
+        }
+
+
+def demo_playback() -> dict[str, Any]:
+    return demo_playback_frames()
 
 
 def portfolio(mode_override: str | None = None) -> dict:
@@ -203,7 +1022,9 @@ def positions(mode: str | None = None) -> list[dict]:
             )
             token = session.scalar(select(Token).where(Token.mode == mode, Token.mint == pos.mint))
             mark = obs.price_usd if obs else None
-            fresh = bool(obs and mark is not None and (now - obs.observed_at).total_seconds() <= limits.market_max_age_seconds)
+            fresh = bool(
+                obs and mark is not None and (now - obs.observed_at).total_seconds() <= limits.market_max_age_seconds
+            )
             unrealized = None
             if pos.status == "open" and fresh and mark is not None:
                 unrealized = q_usdc(mark * pos.qty - pos.cost_basis)
@@ -238,7 +1059,9 @@ def positions(mode: str | None = None) -> list[dict]:
 def orders(mode: str | None = None) -> list[dict]:
     with session_scope() as session:
         mode = mode or _mode(session)
-        rows = session.scalars(select(PaperOrder).where(PaperOrder.mode == mode).order_by(desc(PaperOrder.created_at)).limit(100)).all()
+        rows = session.scalars(
+            select(PaperOrder).where(PaperOrder.mode == mode).order_by(desc(PaperOrder.created_at)).limit(100)
+        ).all()
         payload = []
         for row in rows:
             fills = session.scalars(select(PaperFill).where(PaperFill.order_id == row.id)).all()
@@ -281,7 +1104,7 @@ def tokens(mode: str | None = None) -> list[dict]:
             obs = session.scalar(
                 select(MarketObservation)
                 .where(MarketObservation.mode == mode, MarketObservation.mint == token.mint)
-                .order_by(desc(MarketObservation.observed_at))
+                .order_by(desc(MarketObservation.observed_at), desc(MarketObservation.discovery_score))
             )
             sec = session.scalar(
                 select(SecurityAssessment)
@@ -333,16 +1156,22 @@ def token_detail(mint: str) -> dict | None:
             .order_by(MarketObservation.observed_at)
         ).all()
         security = session.scalars(
-            select(SecurityAssessment).where(SecurityAssessment.mode == mode, SecurityAssessment.mint == mint).order_by(desc(SecurityAssessment.observed_at))
+            select(SecurityAssessment)
+            .where(SecurityAssessment.mode == mode, SecurityAssessment.mint == mint)
+            .order_by(desc(SecurityAssessment.observed_at))
         ).all()
-        events = session.scalars(
+        events_rows = session.scalars(
             select(AgentEvent).where(AgentEvent.mode == mode, AgentEvent.mint == mint).order_by(AgentEvent.created_at)
         ).all()
-        decisions = session.scalars(
-            select(RiskDecision).where(RiskDecision.mode == mode, RiskDecision.mint == mint).order_by(desc(RiskDecision.created_at))
+        decisions_rows = session.scalars(
+            select(RiskDecision)
+            .where(RiskDecision.mode == mode, RiskDecision.mint == mint)
+            .order_by(desc(RiskDecision.created_at))
         ).all()
         proposals = session.scalars(
-            select(StrategyProposal).where(StrategyProposal.mode == mode, StrategyProposal.mint == mint).order_by(desc(StrategyProposal.created_at))
+            select(StrategyProposal)
+            .where(StrategyProposal.mode == mode, StrategyProposal.mint == mint)
+            .order_by(desc(StrategyProposal.created_at))
         ).all()
         latest = observations[-1] if observations else None
         return {
@@ -362,8 +1191,11 @@ def token_detail(mint: str) -> dict | None:
                 "volume_m5": _s(latest.volume_m5) if latest else None,
                 "price_change_m5": _s(latest.price_change_m5) if latest else None,
                 "provider": latest.provider if latest else None,
-                "provider_reported_at": latest.provider_reported_at.isoformat() if latest and latest.provider_reported_at else None,
+                "provider_reported_at": (
+                    latest.provider_reported_at.isoformat() if latest and latest.provider_reported_at else None
+                ),
                 "observed_at": latest.observed_at.isoformat() if latest else None,
+                "provenance": latest.provenance if latest else None,
             },
             "chart": [
                 {
@@ -374,6 +1206,7 @@ def token_detail(mint: str) -> dict | None:
                 for row in observations
                 if row.price_usd is not None
             ],
+            "candles": _candles_from_observations(observations),
             "security": [
                 {
                     "at": row.observed_at.isoformat(),
@@ -386,7 +1219,7 @@ def token_detail(mint: str) -> dict | None:
                 }
                 for row in security
             ],
-            "momentum": [row.payload for row in events if row.event_type == "momentum.report"][-3:],
+            "momentum": [row.payload for row in events_rows if row.event_type == "momentum.report"][-3:],
             "proposals": [
                 {
                     "id": row.id,
@@ -407,9 +1240,9 @@ def token_detail(mint: str) -> dict | None:
                     "explanation": row.explanation,
                     "at": row.created_at.isoformat(),
                 }
-                for row in decisions
+                for row in decisions_rows
             ],
-            "events": [_event(row) for row in events],
+            "events": [_event(row) for row in events_rows],
         }
 
 
@@ -418,6 +1251,7 @@ def _event(row: AgentEvent) -> dict:
         "id": row.id,
         "at": row.created_at.isoformat(),
         "source": row.source_agent,
+        "seat": (row.payload or {}).get("seat"),
         "type": row.event_type,
         "mint": row.mint,
         "correlation_id": row.correlation_id,
@@ -458,7 +1292,9 @@ def events(limit: int = 80) -> list[dict]:
 def decisions() -> list[dict]:
     with session_scope() as session:
         mode = _mode(session)
-        rows = session.scalars(select(RiskDecision).where(RiskDecision.mode == mode).order_by(desc(RiskDecision.created_at)).limit(100)).all()
+        rows = session.scalars(
+            select(RiskDecision).where(RiskDecision.mode == mode).order_by(desc(RiskDecision.created_at)).limit(100)
+        ).all()
         return [
             {
                 "id": row.id,
@@ -481,7 +1317,9 @@ def analytics() -> dict:
         ).all()
         closed = session.scalars(select(Position).where(Position.mode == mode, Position.status == "closed")).all()
         fills = session.scalars(select(PaperFill).where(PaperFill.mode == mode)).all()
-        rejected = session.scalars(select(RiskDecision).where(RiskDecision.mode == mode, RiskDecision.approved == False)).all()  # noqa: E712
+        rejected = session.scalars(
+            select(RiskDecision).where(RiskDecision.mode == mode, RiskDecision.approved == False)  # noqa: E712
+        ).all()
         gains = [row.realized_pnl for row in closed if row.realized_pnl > 0]
         losses = [row.realized_pnl for row in closed if row.realized_pnl < 0]
         fees = [row.fee for row in fills]
@@ -521,13 +1359,21 @@ def settings_view(settings: Settings) -> dict:
             "scanner": config.get("scanner"),
             "strategy": config.get("strategy"),
             "risk": config.get("risk"),
+            "thresholds": config.get("thresholds") or {
+                "hard": DEFAULT_THRESHOLDS["hard"],
+                "soft": DEFAULT_THRESHOLDS["soft"],
+            },
             "simulation": config.get("simulation"),
             "ai": {
                 "hourly_budget": (config.get("ai") or {}).get("hourly_budget"),
                 "configured": bool(settings.xai_api_key),
                 "model": settings.xai_model if settings.xai_api_key else None,
+                "jev_configured": bool(settings.typesafe_api_key),
+                "jev_model": settings.typesafe_model if settings.typesafe_api_key else None,
             },
             "providers": {
+                "gmgn_configured": bool(settings.gmgn_api_key),
+                "typesafe_jev_configured": bool(settings.typesafe_api_key),
                 "jupiter_configured": bool(settings.jupiter_api_key),
                 "birdeye_configured": bool(settings.birdeye_api_key),
                 "solana_rpc_configured": bool(settings.solana_rpc_url),
@@ -549,7 +1395,9 @@ def providers() -> list[dict]:
 def alerts() -> list[dict]:
     with session_scope() as session:
         mode = _mode(session)
-        rows = session.scalars(select(Alert).where(Alert.mode == mode).order_by(desc(Alert.created_at)).limit(50)).all()
+        rows = session.scalars(
+            select(Alert).where(Alert.mode == mode).order_by(desc(Alert.created_at)).limit(50)
+        ).all()
         return [
             {
                 "id": row.id,
@@ -565,8 +1413,6 @@ def alerts() -> list[dict]:
 
 
 def backtests() -> list[dict]:
-    from app.models import BacktestRun
-
     with session_scope() as session:
         rows = session.scalars(select(BacktestRun).order_by(desc(BacktestRun.created_at)).limit(20)).all()
         return [
@@ -584,8 +1430,6 @@ def backtests() -> list[dict]:
 
 
 def backtest_detail(run_id: str) -> dict | None:
-    from app.models import BacktestRun
-
     with session_scope() as session:
         row = session.get(BacktestRun, run_id)
         if row is None:

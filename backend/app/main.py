@@ -1,4 +1,4 @@
-"""HTTP and WebSocket API. State changes require the admin token."""
+"""HTTP, SSE, and WebSocket API. State changes require the admin token."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,13 +25,18 @@ from app.queries import (
     analytics,
     backtest_detail,
     backtests,
+    bench_list,
     decisions,
+    demo_playback,
+    desk_state,
     events,
     orders,
     portfolio,
     positions,
     providers,
+    seat_inspector,
     settings_view,
+    shadow_list,
     summary,
     token_detail,
     tokens,
@@ -46,6 +51,8 @@ DIST = ROOT / "frontend" / "dist"
 class Hub:
     def __init__(self) -> None:
         self.clients: set[WebSocket] = set()
+        self.sse_queues: set[asyncio.Queue[dict]] = set()
+        self.shutdown = asyncio.Event()
 
     async def publish(self, message: dict) -> None:
         dead = []
@@ -56,6 +63,13 @@ class Hub:
                 dead.append(socket)
         for socket in dead:
             self.clients.discard(socket)
+        for queue in list(self.sse_queues):
+            try:
+                if queue.full():
+                    queue.get_nowait()
+                queue.put_nowait(message)
+            except Exception:
+                self.sse_queues.discard(queue)
 
 
 class SettingsPatch(BaseModel):
@@ -64,8 +78,18 @@ class SettingsPatch(BaseModel):
     scanner: dict | None = None
     strategy: dict | None = None
     risk: dict | None = None
+    thresholds: dict | None = None
     simulation: dict | None = None
     ai: dict | None = None
+
+
+class ThresholdsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    hard: dict | None = None
+    soft: dict | None = None
+    shadow_mode: bool | None = None
+    one_position_at_a_time: bool | None = None
+    use_bench: bool | None = None
 
 
 class StopBody(BaseModel):
@@ -84,8 +108,8 @@ class ReplayBody(BaseModel):
 
 
 def _check_risk_patch(risk: dict) -> None:
-    forbidden = {"live_trading", "execute", "private_key", "seed_phrase", "leverage", "short"}
-    if forbidden.intersection(risk):
+    forbidden = {"live_trading", "execute", "leverage", "short", "live_execution_enabled"}
+    if forbidden.intersection(risk) or any("key" in str(k).lower() or "phrase" in str(k).lower() for k in risk):
         raise HTTPException(status_code=422, detail="risk controls cannot enable execution or leverage")
     bounds = {
         "max_new_trade_usd": (Decimal("1"), Decimal("100")),
@@ -100,6 +124,18 @@ def _check_risk_patch(risk: dict) -> None:
             value = Decimal(str(risk[key]))
             if value < low or value > high:
                 raise HTTPException(status_code=422, detail=f"{key} is outside the allowed paper-trading range")
+
+
+def _check_thresholds_patch(thresholds: dict) -> None:
+    forbidden = {"live_trading", "execute", "swap", "live_execution_enabled"}
+    if forbidden.intersection(thresholds):
+        raise HTTPException(status_code=422, detail="thresholds cannot enable live trading")
+    hard = thresholds.get("hard")
+    if isinstance(hard, dict):
+        if "min_age_minutes" in hard and not (0 <= float(hard["min_age_minutes"]) <= 1440):
+            raise HTTPException(status_code=422, detail="min_age_minutes out of range")
+        if "min_liquidity_usd" in hard and not (0 <= float(hard["min_liquidity_usd"]) <= 10_000_000):
+            raise HTTPException(status_code=422, detail="min_liquidity_usd out of range")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -131,11 +167,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
             task = asyncio.create_task(loop())
         yield
+        hub.shutdown.set()
         if task:
             task.cancel()
         await swarm.aclose()
 
-    app = FastAPI(title="SOL SWARM", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="SOL SWARM", version="0.2.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.swarm = swarm
     app.state.hub = hub
@@ -147,24 +184,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    def reader(
-        authorization: str | None = None,
-        x_solswarm_token: str | None = None,
-    ) -> Role:
-        return resolve_role(settings, authorization, x_solswarm_token)
-
-    # FastAPI injects headers when the dependency is declared on the route.
-    def reader_dep(authorization: str | None = Query(default=None), x_solswarm_token: str | None = Query(default=None)) -> Role:
-        # Placeholder replaced below with Header dependencies.
-        raise RuntimeError(authorization or x_solswarm_token)
-
-    from fastapi import Header
-
     def reader_header(
         authorization: str | None = Header(default=None),
         x_solswarm_token: str | None = Header(default=None),
     ) -> Role:
         return resolve_role(settings, authorization, x_solswarm_token)
+
+    def stream_reader(
+        token: str | None = Query(default=None),
+        authorization: str | None = Header(default=None),
+        x_solswarm_token: str | None = Header(default=None),
+    ) -> Role:
+        auth_val = authorization or (f"Bearer {token}" if token else None)
+        return resolve_role(settings, auth_val, x_solswarm_token)
 
     def admin_header(role: Role = Depends(reader_header)) -> Role:
         return require_admin(role)
@@ -175,12 +207,73 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "status": "ok",
             "paper_trading": True,
             "live_execution_enabled": False,
+            "venue": "gmgn_paper_only",
             "service": "sol-swarm",
         }
 
     @app.get("/api/summary")
     def get_summary(_role: Role = Depends(reader_header)):
         return summary(settings, swarm)
+
+    @app.get("/api/desk")
+    def get_desk(_role: Role = Depends(reader_header)):
+        return desk_state(settings, swarm)
+
+    @app.get("/api/desk/demo-playback")
+    def get_demo_playback(_role: Role = Depends(reader_header)):
+        return demo_playback()
+
+    @app.get("/api/desk/seats/{seat}")
+    def get_seat(seat: str, _role: Role = Depends(reader_header)):
+        info = seat_inspector(seat, settings, swarm)
+        if info is None:
+            raise HTTPException(status_code=404, detail="unknown desk seat")
+        return info
+
+    @app.get("/api/bench")
+    def get_bench(_role: Role = Depends(reader_header)):
+        return bench_list()
+
+    @app.get("/api/shadow")
+    def get_shadow(_role: Role = Depends(reader_header)):
+        return shadow_list()
+
+    @app.get("/api/thresholds")
+    def get_thresholds(_role: Role = Depends(reader_header)):
+        return desk_state(settings, swarm)["thresholds"]
+
+    @app.put("/api/thresholds")
+    async def put_thresholds(body: ThresholdsPatch, _role: Role = Depends(admin_header)):
+        patch_dict: dict = {}
+        th_patch: dict = {}
+        if body.hard is not None:
+            th_patch["hard"] = body.hard
+        if body.soft is not None:
+            th_patch["soft"] = body.soft
+        if th_patch:
+            _check_thresholds_patch(th_patch)
+            patch_dict["thresholds"] = th_patch
+        scanner_patch: dict = {}
+        if body.shadow_mode is not None:
+            scanner_patch["shadow_mode"] = body.shadow_mode
+        if body.one_position_at_a_time is not None:
+            scanner_patch["one_position_at_a_time"] = body.one_position_at_a_time
+        if body.use_bench is not None:
+            scanner_patch["use_bench"] = body.use_bench
+        if scanner_patch:
+            patch_dict["scanner"] = scanner_patch
+        if "hard" in th_patch:
+            risk_sync: dict = {}
+            if "min_liquidity_usd" in th_patch["hard"]:
+                risk_sync["min_pool_liquidity_usd"] = str(th_patch["hard"]["min_liquidity_usd"])
+            if "min_age_minutes" in th_patch["hard"]:
+                risk_sync["min_pool_age_minutes"] = int(th_patch["hard"]["min_age_minutes"])
+            if risk_sync:
+                _check_risk_patch(risk_sync)
+                patch_dict["risk"] = risk_sync
+        swarm.update_settings(patch_dict, actor="admin")
+        await hub.publish({"type": "thresholds_updated"})
+        return desk_state(settings, swarm)["thresholds"]
 
     @app.get("/api/portfolio")
     def get_portfolio(_role: Role = Depends(reader_header)):
@@ -213,6 +306,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def get_events(_role: Role = Depends(reader_header)):
         return events()
 
+    @app.get("/api/events/stream")
+    async def get_events_stream(request: Request, _role: Role = Depends(stream_reader)):
+        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=32)
+        hub.sse_queues.add(queue)
+
+        async def generator():
+            try:
+                hello = {"type": "hello", "paper_trading": True, "live_execution_enabled": False}
+                yield f"data: {json.dumps(hello)}\n\n"
+                while not hub.shutdown.is_set():
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        msg = await asyncio.wait_for(queue.get(), timeout=2.0)
+                        yield f"data: {json.dumps(msg)}\n\n"
+                    except TimeoutError:
+                        yield ": keepalive\n\n"
+            finally:
+                hub.sse_queues.discard(queue)
+
+        return StreamingResponse(
+            generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @app.get("/api/decisions")
     def get_decisions(_role: Role = Depends(reader_header)):
         return decisions()
@@ -226,16 +345,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return settings_view(settings)
 
     @app.put("/api/settings")
-    def put_settings(body: SettingsPatch, _role: Role = Depends(admin_header)):
+    async def put_settings(body: SettingsPatch, _role: Role = Depends(admin_header)):
         patch = body.model_dump(exclude_none=True)
         if "risk" in patch:
             _check_risk_patch(patch["risk"])
+        if "thresholds" in patch:
+            _check_thresholds_patch(patch["thresholds"])
         if "strategy" in patch and "live_trading" in patch["strategy"]:
             raise HTTPException(status_code=422, detail="strategy cannot enable live trading")
         try:
             updated = swarm.update_settings(patch, actor="admin")
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        await hub.publish({"type": "settings_updated"})
         return settings_view(settings) | {"saved": True, "mode": updated.get("mode")}
 
     @app.get("/api/providers")
@@ -263,11 +385,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return result
 
     @app.post("/api/control/mode")
-    def post_mode(body: ModeBody, _role: Role = Depends(admin_header)):
+    async def post_mode(body: ModeBody, _role: Role = Depends(admin_header)):
         if body.mode not in {"demo", "live"}:
             raise HTTPException(status_code=422, detail="mode must be demo or live")
         swarm.update_settings({"mode": body.mode}, actor="admin")
+        await hub.publish({"type": "mode_changed", "mode": body.mode})
         return {"mode": body.mode, "paper_trading": True, "live_execution_enabled": False}
+
+    @app.post("/api/control/cycle")
+    async def post_cycle(_role: Role = Depends(admin_header)):
+        result = await swarm.run_cycle()
+        await hub.publish({"type": "cycle", "summary": summary(settings, swarm)})
+        return result
 
     @app.get("/api/backtests")
     def get_backtests(_role: Role = Depends(reader_header)):
@@ -318,10 +447,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with session_scope() as session:
             return int(session.scalar(select(func.count()).select_from(PaperOrder)) or 0)
 
-    # Read-only monitor surface for external agents. No control routes exist here.
+    # Read-only monitor surface for external agents (Claude, Grok Bot). No control routes exist here.
     @app.get("/api/monitor/summary")
     def monitor_summary(_role: Role = Depends(reader_header)):
         return summary(settings, swarm)
+
+    @app.get("/api/monitor/desk")
+    def monitor_desk(_role: Role = Depends(reader_header)):
+        return desk_state(settings, swarm)
+
+    @app.get("/api/monitor/bench")
+    def monitor_bench(_role: Role = Depends(reader_header)):
+        return bench_list()
+
+    @app.get("/api/monitor/shadow")
+    def monitor_shadow(_role: Role = Depends(reader_header)):
+        return shadow_list()
+
+    @app.get("/api/monitor/thresholds")
+    def monitor_thresholds(_role: Role = Depends(reader_header)):
+        return desk_state(settings, swarm)["thresholds"]
 
     @app.get("/api/monitor/portfolio")
     def monitor_portfolio(_role: Role = Depends(reader_header)):
@@ -372,6 +517,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             hub.clients.discard(socket)
         finally:
             hub.clients.discard(socket)
+
+    @app.api_route(
+        "/api/{unmatched:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        include_in_schema=False,
+    )
+    def unmatched_api(unmatched: str):
+        raise HTTPException(status_code=404, detail=f"unknown api route /api/{unmatched}")
 
     index = DIST / "index.html"
     if index.exists():

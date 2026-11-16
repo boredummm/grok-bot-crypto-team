@@ -37,7 +37,7 @@ Push-Location "$Root\frontend"
 if (-not (Test-Path "node_modules")) { npm install }
 Pop-Location
 
-$backend = Start-Process -FilePath "$Root\.venv\Scripts\python.exe" -ArgumentList "-m","uvicorn","app.main:create_app","--factory","--host","127.0.0.1","--port","8000" -WorkingDirectory "$Root\backend" -PassThru
+$backend = Start-Process -FilePath "$Root\.venv\Scripts\python.exe" -ArgumentList "-m","uvicorn","app.main:create_app","--factory","--host","127.0.0.1","--port","8000","--timeout-graceful-shutdown","2" -WorkingDirectory "$Root\backend" -PassThru
 $frontend = Start-Process -FilePath "npm" -ArgumentList "run","dev","--","--host","127.0.0.1","--port","5173" -WorkingDirectory "$Root\frontend" -PassThru
 Write-Host "API http://127.0.0.1:8000  Dashboard http://127.0.0.1:5173"
 Write-Host "Backend pid $($backend.Id)  Frontend pid $($frontend.Id)"
